@@ -1,0 +1,7 @@
+.claude
+__pycache__
+*/__pycache__
+
+*.nii.gz
+*.csv
+*.pth
