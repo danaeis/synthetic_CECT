@@ -174,17 +174,18 @@ class DinoV3VolumeEncoder(_VolumeEncoderBase):
 
     def _try_timm_dinov3(self):
         import timm
-        names = [m for m in timm.list_models() if 'dinov3' in m and 'vits' in m] \
-                or [m for m in timm.list_models() if 'dinov3' in m]
-        if not names:
-            raise RuntimeError('timm has no dinov3 models in this version')
-        self.backbone = timm.create_model(names[0], pretrained=True, num_classes=0)
+        name = 'vit_small_patch16_dinov3.lvd1689m'
+        if name not in timm.list_models():
+            raise RuntimeError(f'{name} not in this timm version')
+        self.backbone = timm.create_model(name, pretrained=True, num_classes=0,
+                                        dynamic_img_size=True)
         self.feat_dim = self.backbone.num_features
-        self.source = f'timm:{names[0]}'
+        self.source = f'timm:{name}'
 
     def _try_timm_dinov2(self):
         import timm
-        self.backbone = timm.create_model(_TIMM_DINOV2, pretrained=True, num_classes=0)
+        self.backbone = timm.create_model(_TIMM_DINOV2, pretrained=True, num_classes=0,
+                                        dynamic_img_size=True)
         self.feat_dim = self.backbone.num_features
         self.source = f'timm:{_TIMM_DINOV2}'
 

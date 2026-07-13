@@ -7,9 +7,9 @@ def download_medvit_checkpoint(model_size='small', force_download=False):
     import os
     
     urls = {
-        'tiny': 'https://github.com/Omid-Nejad/MedViT/releases/download/v1.0/medvit_tiny.pth',
-        'small': 'https://github.com/Omid-Nejad/MedViT/releases/download/v1.0/medvit_small.pth', 
-        'base': 'https://github.com/Omid-Nejad/MedViT/releases/download/v1.0/medvit_base.pth'
+        'tiny': 'https://drive.google.com/file/d/14wcH5cm8P63cMZAUHA1lhhJgMVOw_5VQ/view?usp=sharing',
+        'small': 'https://drive.google.com/file/d/1Lrfzjf3CK7YOztKa8D6lTUZjYJIiT7_s/view?usp=sharing', 
+        'base': 'https://drive.google.com/file/d/1sU-nLpYuCI65h7MjFJKG0yphNAlUFSKG/view?usp=sharing'
     }
     
     if model_size not in urls:
