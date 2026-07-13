@@ -228,12 +228,26 @@ class CTPairDataset(Dataset):
         self.hu_min = float(cfg.get('hu_min', -200))
         self.hu_max = float(cfg.get('hu_max',  300))
 
-        # Organ/vessel mask is only loaded from disk if a loss that consumes
-        # it is actually enabled — avoids the extra I/O and RAM for runs
-        # that don't use it.
-        self.load_mask = bool(cfg.get('use_organ', False) or cfg.get('use_seg_consistency', False))
+        # Organ-focused sampling: bias a fraction of patch centres onto organ/
+        # vessel voxels so patches actually CONTAIN the structures the organ and
+        # phase-consistency losses care about (a uniform 128² grid drops most
+        # patches on parenchyma/fat/bowel and almost never on the aorta/portal
+        # vein/IVC, making those losses near-degenerate). 0.0 = legacy uniform
+        # grid behaviour. `organ_focus_labels` (list of int label ids) restricts
+        # the focus to specific organs when the mask is TotalSegmentator
+        # MULTILABEL; None → any segmented voxel (mask > 0).
+        self.organ_focus_frac   = float(cfg.get('organ_focus_frac', 0.0))
+        self.organ_focus_labels = cfg.get('organ_focus_labels', None)
+        self.max_focus_cand     = int(cfg.get('max_focus_candidates_per_vol', 3000))
+
+        # Organ/vessel mask is only loaded from disk if a loss that consumes it
+        # is enabled OR organ-focused sampling needs it to place patch centres.
+        self.load_mask = bool(cfg.get('use_organ', False)
+                              or cfg.get('use_seg_consistency', False)
+                              or self.organ_focus_frac > 0.0)
 
         rng = np.random.default_rng(cfg.get('seed', 42))
+        self._rng = rng
 
         # ── Cache: skip indexing + preload entirely if a prior run already
         # produced the identical patch set (same source/target files, patch
@@ -254,11 +268,14 @@ class CTPairDataset(Dataset):
             return
 
         # ── Step 1: index valid coordinates ──────────────────────────────────
-        coords: List[Tuple] = []
+        coords: List[Tuple] = []          # uniform-grid candidates
+        focus_coords: List[Tuple] = []    # organ/vessel-centred candidates
         n_skip = 0
         log.info(f"[{split_name}] Indexing {len(pairs)} pairs "
                  f"(patch={self.ph}×{self.pw}×{self.patch_depth}, "
-                 f"stride={self.stride_h}×{self.stride_w}) …")
+                 f"stride={self.stride_h}×{self.stride_w}"
+                 + (f", organ_focus={self.organ_focus_frac:.2f}"
+                    if self.organ_focus_frac > 0 else "") + ") …")
 
         n_missing_seg = 0
         for pair in pairs:
@@ -313,20 +330,30 @@ class CTPairDataset(Dataset):
                             n_skip += 1; continue
                         coords.append((src_path, tgt_path, seg_path, z, y, x))
 
-        log.info(f"  {len(coords)} valid coords, {n_skip} rejected")
+            # Organ/vessel-centred candidates for this pair (only when enabled).
+            if self.organ_focus_frac > 0.0 and seg_path is not None:
+                focus_coords.extend(
+                    self._organ_centred_coords(src_vol, seg_path, src_path, tgt_path,
+                                               z_start, z_end, H, W))
+
+        log.info(f"  {len(coords)} valid grid coords"
+                 + (f", {len(focus_coords)} organ-centred coords" if self.organ_focus_frac > 0 else "")
+                 + f", {n_skip} rejected")
         if self.load_mask and n_missing_seg:
             log.warning(f"  [{split_name}] {n_missing_seg}/{len(pairs)} pairs have no "
                         f"segmentation mask on disk — those patches will use a zero mask")
 
-        if not coords:
+        if not coords and not focus_coords:
             self._debug(pairs)
             self.src_patches: List[np.ndarray] = []
             self.tgt_patches: List[np.ndarray] = []
             self.mask_patches = [] if self.load_mask else None
             return
 
-        # ── Step 2: sub-sample ────────────────────────────────────────────────
-        if max_patches and len(coords) > max_patches:
+        # ── Step 2: sub-sample (mixing organ-focused + grid candidates) ───────
+        if self.organ_focus_frac > 0.0:
+            coords = self._mix_focus_and_grid(coords, focus_coords, max_patches, rng)
+        elif max_patches and len(coords) > max_patches:
             chosen = rng.choice(len(coords), max_patches, replace=False)
             coords = [coords[i] for i in chosen]
             log.info(f"  Sub-sampled to {len(coords)} patches for RAM preload")
@@ -392,6 +419,77 @@ class CTPairDataset(Dataset):
             log.info(f"  [{split_name}] Cached patches to {self._cache_file}")
 
     # -----------------------------------------------------------------------
+    def _organ_centred_coords(self, src_vol, seg_path, src_path, tgt_path,
+                              z_start, z_end, H, W) -> List[Tuple]:
+        """Patch centres placed ON organ/vessel voxels (validity-filtered).
+
+        Draws up to `max_focus_candidates_per_vol` random voxels from the target
+        organ set, clamps each to a legal patch centre, and keeps it if the NCCT
+        patch there passes the same HU validity filter as the grid path.
+        """
+        try:
+            seg_vol = _load_vol(seg_path)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"  organ-focus: failed to load {seg_path}: {e}")
+            return []
+        if seg_vol.shape != src_vol.shape:
+            return []
+
+        if self.organ_focus_labels:
+            organ = np.isin(seg_vol, np.asarray(self.organ_focus_labels))
+        else:
+            organ = seg_vol > 0
+        vox = np.argwhere(organ)                      # (K,3) in (z,y,x)
+        if len(vox) == 0:
+            return []
+        if len(vox) > self.max_focus_cand:
+            sel = self._rng.choice(len(vox), self.max_focus_cand, replace=False)
+            vox = vox[sel]
+
+        out: List[Tuple] = []
+        seen = set()
+        for z, y, x in vox:
+            z = int(np.clip(z, z_start, z_end - 1))
+            y = int(np.clip(y, self.half_h, H - self.half_h))
+            x = int(np.clip(x, self.half_w, W - self.half_w))
+            key = (z, y, x)
+            if key in seen:
+                continue
+            seen.add(key)
+            sp = src_vol[z, y - self.half_h: y + self.half_h,
+                         x - self.half_w: x + self.half_w]
+            if sp.shape != (self.ph, self.pw):
+                continue
+            if sp.std() < self.min_std or sp.mean() < self.min_mean or sp.max() < self.min_max:
+                continue
+            out.append((src_path, tgt_path, seg_path, z, y, x))
+        return out
+
+    # -----------------------------------------------------------------------
+    def _mix_focus_and_grid(self, grid, focus, max_patches, rng) -> List[Tuple]:
+        """Blend organ-centred and grid candidates so ~organ_focus_frac of the
+        final patches are organ-centred (backfilling from the other pool if one
+        runs short so we still hit max_patches)."""
+        budget = max_patches if max_patches else (len(grid) + len(focus))
+        n_focus = min(len(focus), int(round(budget * self.organ_focus_frac)))
+        n_grid  = budget - n_focus
+        if n_grid > len(grid):                      # not enough grid → more focus
+            n_focus = min(len(focus), n_focus + (n_grid - len(grid)))
+            n_grid  = min(len(grid), budget - n_focus)
+
+        def _take(pool, k):
+            if k <= 0 or not pool:
+                return []
+            if k >= len(pool):
+                return list(pool)
+            return [pool[i] for i in rng.choice(len(pool), k, replace=False)]
+
+        chosen = _take(focus, n_focus) + _take(grid, n_grid)
+        log.info(f"  Organ-focus mix: {n_focus} organ-centred + {n_grid} grid "
+                 f"= {len(chosen)} patches (frac={self.organ_focus_frac:.2f})")
+        return chosen
+
+    # -----------------------------------------------------------------------
     def _cache_path(self, pairs: List[Dict], cfg: Dict, max_patches: Optional[int]) -> Optional[Path]:
         """
         Deterministic on-disk cache location for this exact preloaded patch
@@ -419,6 +517,13 @@ class CTPairDataset(Dataset):
             'load_mask':    self.load_mask,
             'split_name':   self.split_name,
         }
+        # Only perturb the cache key when organ-focus is on, so existing
+        # uniform-grid caches remain valid for legacy (frac==0) runs.
+        if self.organ_focus_frac > 0.0:
+            key_data['organ_focus_frac']   = self.organ_focus_frac
+            key_data['organ_focus_labels'] = (sorted(self.organ_focus_labels)
+                                              if self.organ_focus_labels else None)
+            key_data['max_focus_cand']     = self.max_focus_cand
         digest = hashlib.md5(json.dumps(key_data, sort_keys=True).encode()).hexdigest()[:16]
         return Path(cache_dir) / f'{self.split_name}_{digest}.npz'
 
@@ -515,13 +620,16 @@ def build_loaders(cfg: Dict) -> Tuple[DataLoader, DataLoader]:
     )
 
     num_workers = cfg.get('num_workers', 0)   # 0 = fastest when patches are in RAM
+    # pin_memory only helps (and is only valid) when copying to a CUDA device;
+    # on CPU it does nothing but emit a warning, so gate it on the actual device.
+    pin = str(cfg.get('device', 'cpu')).startswith('cuda')
 
     train_loader = DataLoader(
         train_ds,
         batch_size  = cfg['batch_size'],
         shuffle     = True,
         num_workers = num_workers,
-        pin_memory  = True,
+        pin_memory  = pin,
         drop_last   = True,
     )
     val_loader = DataLoader(
@@ -529,7 +637,7 @@ def build_loaders(cfg: Dict) -> Tuple[DataLoader, DataLoader]:
         batch_size  = cfg['batch_size'],
         shuffle     = False,
         num_workers = num_workers,
-        pin_memory  = True,
+        pin_memory  = pin,
     )
 
     log.info(f"Train loader: {len(train_loader)} batches  |  "

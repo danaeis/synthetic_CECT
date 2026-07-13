@@ -332,12 +332,25 @@ class Trainer:
 
     # -----------------------------------------------------------------------
     def _save_checkpoint(self, epoch: int, is_best: bool):
+        # Everything needed to resume *exactly* where we left off: not just the
+        # weights, but the optimiser, LR scheduler, AMP scalers, step counter,
+        # metric history and early-stopping state. Without the scheduler/history
+        # a resume would restart the cosine LR cycle and drop the loss curves.
         state = {
-            'epoch':    epoch,
-            'G_state':  self.G.state_dict(),
-            'opt_G':    self.opt_G.state_dict(),
-            'best_val': self.best_val_loss,
+            'epoch':       epoch,
+            'global_step': self.global_step,
+            'G_state':     self.G.state_dict(),
+            'opt_G':       self.opt_G.state_dict(),
+            'best_val':    self.best_val_loss,
+            'history':     self.history,
+            'early_stop':  {'best': self.early_stop.best,
+                            'counter': self.early_stop.counter},
         }
+        if self.sched_G is not None:
+            state['sched_G'] = self.sched_G.state_dict()
+        if self.use_amp:
+            state['scaler_G'] = self.scaler_G.state_dict()
+            state['scaler_D'] = self.scaler_D.state_dict()
         if self.D:
             state['D_state'] = self.D.state_dict()
             state['opt_D']   = self.opt_D.state_dict()
@@ -359,9 +372,32 @@ class Trainer:
         if 'D_state' in state and self.D:
             self.D.load_state_dict(state['D_state'])
             self.opt_D.load_state_dict(state['opt_D'])
+        if 'sched_G' in state and self.sched_G is not None:
+            self.sched_G.load_state_dict(state['sched_G'])
+        if self.use_amp:
+            if 'scaler_G' in state:
+                self.scaler_G.load_state_dict(state['scaler_G'])
+            if 'scaler_D' in state:
+                self.scaler_D.load_state_dict(state['scaler_D'])
         self.best_val_loss = state.get('best_val', float('inf'))
+        self.global_step   = state.get('global_step', 0)
+        if state.get('history'):
+            # Keep only the epochs at/below the resume point so re-training an
+            # already-recorded epoch overwrites rather than duplicates it.
+            ep = state.get('epoch', 0)
+            hist = state['history']
+            if hist.get('epoch'):
+                keep = sum(1 for e in hist['epoch'] if e <= ep)
+                self.history = {k: list(v[:keep]) for k, v in hist.items()}
+            else:
+                self.history = hist
+        es = state.get('early_stop')
+        if es:
+            self.early_stop.best    = es.get('best', float('inf'))
+            self.early_stop.counter = es.get('counter', 0)
         ep = state.get('epoch', 0)
-        log.info(f"Resumed from checkpoint epoch {ep}")
+        log.info(f"Resumed from checkpoint epoch {ep} "
+                 f"(global_step={self.global_step}, best_val={self.best_val_loss:.6f})")
         return ep
 
     # -----------------------------------------------------------------------

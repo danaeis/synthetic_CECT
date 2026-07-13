@@ -39,7 +39,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(
 log = logging.getLogger(__name__)
 
 
-def extract_features(encoder, samples, spatial_size, batch_size, device, max_slices):
+def extract_features(encoder, samples, spatial_size, batch_size, device, max_slices,
+                     hu_min, hu_max):
     """Return (features (N,D), labels (N,), groups (N,)) aligned to `samples`.
 
     scan_id is carried through the loader so features stay aligned to their
@@ -48,7 +49,7 @@ def extract_features(encoder, samples, spatial_size, batch_size, device, max_sli
     import torch
     loader = build_phase_loader(samples, spatial_size=spatial_size,
                                 batch_size=batch_size, augment=False,
-                                shuffle=False)
+                                shuffle=False, hu_min=hu_min, hu_max=hu_max)
     encoder = encoder.to(device).eval()
     feats, labels, groups = [], [], []
     with torch.no_grad():
@@ -61,19 +62,24 @@ def extract_features(encoder, samples, spatial_size, batch_size, device, max_sli
     return np.vstack(feats), np.array(labels), np.array(groups)
 
 
-def _feature_cache_path(cache_dir: Path, enc_name: str, split: str) -> Path:
-    return cache_dir / f'{enc_name}_{split}_features.npz'
+def _feature_cache_path(cache_dir: Path, enc_name: str, split: str,
+                        hu_min: float, hu_max: float) -> Path:
+    # HU window is part of the cache key: changing --hu_min/--hu_max changes the
+    # input intensities, so features from a different window must NOT be reused.
+    return cache_dir / f'{enc_name}_{split}_hu{int(hu_min)}_{int(hu_max)}_features.npz'
 
 
 def get_features(encoder, enc_name, split, samples, args, device):
-    """Extract features, using an on-disk cache keyed by encoder+split."""
-    cache = _feature_cache_path(Path(args.output_dir) / 'feature_cache', enc_name, split)
+    """Extract features, using an on-disk cache keyed by encoder+split+HU-window."""
+    cache = _feature_cache_path(Path(args.output_dir) / 'feature_cache', enc_name, split,
+                                args.hu_min, args.hu_max)
     if args.use_cache and cache.exists():
         d = np.load(cache, allow_pickle=True)
         log.info(f"  [{enc_name}/{split}] loaded {len(d['y'])} cached features")
         return d['X'], d['y'], d['g']
     X, y, g = extract_features(encoder, samples, tuple(args.spatial_size),
-                               args.batch_size, device, args.max_slices)
+                               args.batch_size, device, args.max_slices,
+                               args.hu_min, args.hu_max)
     cache.parent.mkdir(parents=True, exist_ok=True)
     np.savez(cache, X=X, y=y, g=g)
     log.info(f"  [{enc_name}/{split}] extracted + cached {len(y)} features")
@@ -106,6 +112,12 @@ def main():
     ap.add_argument('--medvit_pretrained_path', default='')
     ap.add_argument('--medvit_size', default='small', choices=['small', 'base'])
     ap.add_argument('--spatial_size', type=int, nargs=3, default=[128, 128, 128])
+    # HU window used to normalise volumes to [0,1] before the frozen encoder.
+    # Contrast-phase differences live in the vascular/soft-tissue enhancement
+    # band (~0-350 HU); a wide window (-1000,1000) compresses that band into
+    # ~17% of the [0,1] range. A narrower window expands the phase signal.
+    ap.add_argument('--hu_min', type=float, default=-160.0)
+    ap.add_argument('--hu_max', type=float, default=400.0)
     ap.add_argument('--max_slices', type=int, default=32)
     ap.add_argument('--batch_size', type=int, default=4)
     ap.add_argument('--val_frac', type=float, default=0.15)

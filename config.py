@@ -68,6 +68,16 @@ MIN_PATCH_STD  =  10.0            # reject near-constant patches (air, padding)
 MIN_PATCH_MEAN = -800.0           # reject pure-air patches
 MIN_PATCH_MAX  = -500.0           # must have at least some tissue
 
+# ── Organ-focused sampling ────────────────────────────────────────────────────
+# Fraction of patches whose CENTRE sits on an organ/vessel voxel (rest stay
+# uniform-grid). 0.0 = legacy behaviour. Raise to ~0.5 when using organ or
+# phase-consistency losses so patches actually contain the aorta/portal vein/IVC
+# those losses depend on. ORGAN_FOCUS_LABELS restricts the focus to specific
+# TotalSegmentator label ids (needs MULTILABEL masks); None = any mask>0 voxel.
+ORGAN_FOCUS_FRAC   = 0.0
+ORGAN_FOCUS_LABELS = None         # e.g. aorta/IVC/portal-vein ids for phase work
+MAX_FOCUS_CAND_PER_VOL = 3000
+
 # ── RAM preload budget ────────────────────────────────────────────────────────
 MAX_TRAIN_PATCHES = 20_000
 MAX_VAL_PATCHES   =  4_000
@@ -187,6 +197,10 @@ train_config: dict = dict(
     min_patch_std        = MIN_PATCH_STD,
     min_patch_mean       = MIN_PATCH_MEAN,
     min_patch_max        = MIN_PATCH_MAX,
+    # organ-focused sampling
+    organ_focus_frac           = ORGAN_FOCUS_FRAC,
+    organ_focus_labels         = ORGAN_FOCUS_LABELS,
+    max_focus_candidates_per_vol = MAX_FOCUS_CAND_PER_VOL,
     # RAM budget
     max_train_patches    = MAX_TRAIN_PATCHES,
     max_val_patches      = MAX_VAL_PATCHES,

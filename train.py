@@ -46,7 +46,15 @@ log = logging.getLogger(__name__)
 
 def _parse():
     p = argparse.ArgumentParser(description='Literature baseline NCCT→CECT')
-    p.add_argument('--resume',      action='store_true')
+    # Resume is now the default: if the output dir already holds a checkpoint we
+    # continue from it. --resume is kept for backwards compatibility (no-op),
+    # and --fresh forces a clean start that ignores any existing checkpoint.
+    p.add_argument('--resume',      action='store_true',
+                   help='(default) continue from the latest checkpoint if one exists')
+    p.add_argument('--fresh',       action='store_true',
+                   help='ignore any existing checkpoint and start training from scratch')
+    p.add_argument('--device',      type=str,   default=None,
+                   help="override device, e.g. 'cuda', 'cuda:0', 'cpu'")
     p.add_argument('--epochs',      type=int,   default=None)
     p.add_argument('--batch_size',  type=int,   default=None)
     p.add_argument('--lr',          type=float, default=None)
@@ -71,6 +79,7 @@ def _parse():
 
 def _apply(cfg: dict, args) -> dict:
     c = cfg.copy()
+    if args.device      is not None: c['device']       = args.device
     if args.epochs      is not None: c['epochs']       = args.epochs
     if args.batch_size  is not None: c['batch_size']   = args.batch_size
     if args.lr          is not None: c['learning_rate']= args.lr
@@ -126,6 +135,31 @@ def main():
     log.info('=' * 65)
     log.info(f"Output     : {out}")
     log.info(f"Device     : {config['device']}")
+
+    # If we asked for CUDA but it isn't usable, fall back to CPU rather than
+    # crashing — and warn loudly, since this is exactly the "silently on CPU"
+    # trap that makes an epoch take ~45 min instead of seconds.
+    if str(config['device']).startswith('cuda') and not torch.cuda.is_available():
+        log.warning("Requested CUDA but torch.cuda.is_available() is False — "
+                    "falling back to CPU.")
+        config['device'] = 'cpu'
+    if config['device'] == 'cpu':
+        log.warning('=' * 65)
+        log.warning("RUNNING ON CPU — training will be VERY slow.")
+        log.warning(f"torch {torch.__version__} | cuda build: {torch.version.cuda} "
+                    f"| cuda available: {torch.cuda.is_available()} "
+                    f"| visible GPUs: {torch.cuda.device_count()}")
+        if torch.version.cuda is None:
+            log.warning("This is a CPU-only torch build (torch.version.cuda is None).")
+            log.warning("Install a CUDA build in the env, e.g.:")
+            log.warning("  pip install --force-reinstall torch "
+                        "--index-url https://download.pytorch.org/whl/cu121")
+        else:
+            log.warning("torch has CUDA support but no GPU is visible — check "
+                        "`nvidia-smi`, drivers, and CUDA_VISIBLE_DEVICES.")
+        log.warning("Then re-run with --resume (default) to continue from the "
+                    "last saved epoch on the GPU.")
+        log.warning('=' * 65)
     log.info(f"Dims       : {config.get('dims', 2)}-D  "
              f"(patch_depth={config.get('patch_depth', 1)}, "
              f"patch_size={config.get('patch_size')})")
@@ -152,12 +186,21 @@ def main():
     # ── Train ────────────────────────────────────────────────────────────────
     trainer = Trainer(config)
     start   = 0
-    if args.resume:
-        ckpt, start = _latest_ckpt(out)
+    ckpt, _ = _latest_ckpt(out)
+    if args.fresh:
         if ckpt:
-            start = trainer.load_checkpoint(str(ckpt))
-        else:
-            log.warning("--resume: no checkpoint found, starting fresh")
+            log.info(f"--fresh: ignoring existing checkpoint {ckpt.name}, "
+                     f"starting from scratch")
+    elif ckpt:
+        start = trainer.load_checkpoint(str(ckpt))
+        if start >= config['epochs']:
+            log.info(f"Checkpoint epoch {start} ≥ target {config['epochs']} epochs — "
+                     f"nothing left to train. Use --epochs to extend or --fresh to restart.")
+            return
+        log.info(f"Auto-resuming from {ckpt.name}: will train epochs "
+                 f"{start + 1} → {config['epochs']}")
+    else:
+        log.info("No checkpoint in output dir — starting fresh.")
 
     try:
         trainer.train(train_loader, val_loader, config['epochs'], start_epoch=start)
