@@ -162,6 +162,13 @@ SALIENCY_MODE       = 'heuristic'    # 'heuristic' | 'dino'
 SALIENCY_WEIGHT      =   5.0
 SALIENCY_THRESHOLD   =   0.08        # only used by 'heuristic' mode
 
+# ── Validation metrics ────────────────────────────────────────────────────────
+# Report MAE / PSNR / SSIM / NCC each epoch, both globally and restricted to the
+# organ-mask region. When True, the val/test datasets preload the co-registered
+# organ mask per patch (train split is unaffected). Organ-region metrics are the
+# clinically meaningful ones — that's where the contrast enhancement lives.
+REPORT_ORGAN_METRICS = True
+
 # ── Misc ─────────────────────────────────────────────────────────────────────
 USE_AMP              = True
 KEEP_N_CHECKPOINTS   = 3
@@ -263,5 +270,6 @@ train_config: dict = dict(
     save_samples_interval   = SAVE_SAMPLES_EVERY,
     keep_last_n_sample_epochs = KEEP_N_SAMPLE_EPOCHS,
     early_stop_patience     = EARLY_STOP_PATIENCE,
+    report_organ_metrics    = REPORT_ORGAN_METRICS,
     device                  = DEVICE,
 )

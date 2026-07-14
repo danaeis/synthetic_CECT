@@ -74,6 +74,43 @@ def _psnr_ssim(pred: torch.Tensor, target: torch.Tensor):
     return _psnr(p, t, 1.0), _ssim(p, t, 1.0)
 
 
+# Metrics reported by _validate, and the minimum voxel count for a masked
+# (organ-region) metric to be meaningful (std/NCC need a few voxels).
+_METRICS = ('mae', 'psnr', 'ssim', 'ncc')
+_MIN_MASK_VOXELS = 16
+
+
+def _center_flat(t: torch.Tensor) -> np.ndarray:
+    """A single tensor item (1,H,W) or (1,D,H,W) → 1-D voxel array. For 3-D the
+    centre slice is taken (same convention as _psnr_ssim), so pred/target/mask
+    are always flattened over the identical voxels."""
+    a = _np(t)
+    if a.ndim == 3:                         # (D, H, W) — centre slice
+        a = a[a.shape[0] // 2]
+    return a.ravel()
+
+
+def _metric_set(p: np.ndarray, t: np.ndarray, data_range: float = 1.0) -> Dict[str, float]:
+    """MAE, PSNR, SSIM, NCC over a set of paired voxel values (1-D arrays).
+
+    SSIM/NCC use the global (non-windowed) single-value formulae so they apply
+    unchanged to an arbitrary voxel subset (e.g. an organ mask), not just a
+    rectangular image — the windowed SSIM used elsewhere can't be restricted to
+    a mask cleanly."""
+    diff = p - t
+    mae = float(np.mean(np.abs(diff)))
+    mse = float(np.mean(diff ** 2))
+    psnr = 100.0 if mse == 0 else float(10.0 * np.log10(data_range ** 2 / mse))
+    mu1, mu2 = float(p.mean()), float(t.mean())
+    s1, s2 = float(p.std()), float(t.std())
+    s12 = float(np.mean((p - mu1) * (t - mu2)))
+    C1, C2 = (0.01 * data_range) ** 2, (0.03 * data_range) ** 2
+    ssim = float(((2 * mu1 * mu2 + C1) * (2 * s12 + C2)) /
+                 ((mu1 ** 2 + mu2 ** 2 + C1) * (s1 ** 2 + s2 ** 2 + C2)))
+    ncc = float(s12 / (s1 * s2 + 1e-8))
+    return {'mae': mae, 'psnr': psnr, 'ssim': ssim, 'ncc': ncc}
+
+
 class EarlyStopping:
     def __init__(self, patience: int = 10):
         self.patience = patience
@@ -175,7 +212,9 @@ class Trainer:
             'train_gen_total', 'train_l1', 'train_adv', 'train_perc', 'train_fm',
             'train_ssim', 'train_grad', 'train_freq', 'train_organ',
             'train_sal', 'train_cycle', 'train_seg', 'train_disc',
-            'val_loss', 'val_psnr', 'val_ssim',
+            'val_loss',
+            'val_mae', 'val_psnr', 'val_ssim', 'val_ncc',              # global
+            'val_org_mae', 'val_org_psnr', 'val_org_ssim', 'val_org_ncc',  # organ-region
         ]}
 
         self._log_active_losses()
@@ -273,22 +312,47 @@ class Trainer:
     # -----------------------------------------------------------------------
     @torch.no_grad()
     def _validate(self, val_loader: DataLoader) -> Dict:
+        """Per-item MAE / PSNR / SSIM / NCC, globally and (if a 'mask' is present
+        in the batch) restricted to the organ-region voxels. Averaged over all
+        validation items."""
         self.G.eval()
-        losses, psnrs, ssims = [], [], []
+        glob = {m: [] for m in _METRICS}     # whole-patch
+        org  = {m: [] for m in _METRICS}     # organ-mask region only
         for batch in val_loader:
             src = batch['source'].to(self.device)
             tgt = batch['target'].to(self.device)
+            mask = batch.get('mask')
             with autocast('cuda', enabled=self.use_amp):
                 fake = self.G(src)
-            losses.append(torch.nn.functional.l1_loss(fake, tgt).item())
-            p, s = _psnr_ssim(fake, tgt)
-            psnrs.append(p); ssims.append(s)
+            for i in range(src.size(0)):
+                p = _center_flat(fake[i]).astype(np.float64)
+                t = _center_flat(tgt[i]).astype(np.float64)
+                for m, v in _metric_set(p, t).items():
+                    glob[m].append(v)
+                if mask is not None:
+                    mk = _center_flat(mask[i]) > 0
+                    if mk.sum() >= _MIN_MASK_VOXELS:
+                        for m, v in _metric_set(p[mk], t[mk]).items():
+                            org[m].append(v)
         self.G.train()
-        return {
-            'val_loss': float(np.mean(losses)) if losses else 0.0,
-            'val_psnr': float(np.mean(psnrs))  if psnrs  else 0.0,
-            'val_ssim': float(np.mean(ssims))  if ssims  else 0.0,
+
+        def _mean(xs): return float(np.mean(xs)) if xs else 0.0
+        out = {
+            # val_loss stays = global MAE: it's the early-stopping / best-model
+            # metric and existing history/plots key.
+            'val_loss': _mean(glob['mae']),
+            'val_mae':  _mean(glob['mae']),
+            'val_psnr': _mean(glob['psnr']),
+            'val_ssim': _mean(glob['ssim']),
+            'val_ncc':  _mean(glob['ncc']),
         }
+        # Organ-region metrics: 0.0 when no masks were loaded (report_organ_metrics
+        # off, or a split without masks). `n_organ_items` disambiguates "0 because
+        # no masks" from a genuine 0 score.
+        for m in _METRICS:
+            out[f'val_org_{m}'] = _mean(org[m])
+        out['n_organ_items'] = len(org['mae'])
+        return out
 
     # -----------------------------------------------------------------------
     def _save_samples(self, val_loader: DataLoader, epoch: int):
@@ -408,9 +472,10 @@ class Trainer:
         for k in ['gen_total', 'disc', 'l1', 'adv', 'perc', 'fm',
                   'ssim', 'grad', 'freq', 'organ', 'sal', 'cycle', 'seg']:
             h[f'train_{k}'].append(avgs.get(k, 0.0))
-        h['val_loss'].append(val['val_loss'])
-        h['val_psnr'].append(val['val_psnr'])
-        h['val_ssim'].append(val['val_ssim'])
+        for k in ['val_loss',
+                  'val_mae', 'val_psnr', 'val_ssim', 'val_ncc',
+                  'val_org_mae', 'val_org_psnr', 'val_org_ssim', 'val_org_ncc']:
+            h[k].append(val.get(k, 0.0))
 
     def _save_history(self):
         hist = {k: [float(v) for v in vl] for k, vl in self.history.items()}
@@ -421,7 +486,7 @@ class Trainer:
         if not self.history['epoch']:
             return
         ep = self.history['epoch']
-        fig, axes = plt.subplots(2, 3, figsize=(16, 8))
+        fig, axes = plt.subplots(2, 4, figsize=(20, 8))
 
         ax = axes[0, 0]
         ax.plot(ep, self.history['train_gen_total'], label='Gen total')
@@ -443,9 +508,19 @@ class Trainer:
                 ax.plot(ep, self.history[k], label=lbl)
         ax.set_title('Extra losses'); ax.legend(); ax.grid(alpha=0.3)
 
-        axes[1, 0].plot(ep, self.history['val_loss']);  axes[1, 0].set_title('Val L1');   axes[1, 0].grid(alpha=0.3)
-        axes[1, 1].plot(ep, self.history['val_psnr']);  axes[1, 1].set_title('Val PSNR'); axes[1, 1].grid(alpha=0.3)
-        axes[1, 2].plot(ep, self.history['val_ssim']);  axes[1, 2].set_title('Val SSIM'); axes[1, 2].grid(alpha=0.3)
+        axes[0, 3].plot(ep, self.history['lr_gen']); axes[0, 3].set_title('LR (gen)')
+        axes[0, 3].grid(alpha=0.3)
+
+        # Bottom row: each of the 4 val metrics, global vs organ-region overlaid.
+        # Only draw the organ line if organ metrics were actually recorded.
+        has_organ = any(v > 0 for v in self.history['val_org_mae'])
+        for col, (m, title) in enumerate([('mae', 'Val MAE'), ('psnr', 'Val PSNR'),
+                                          ('ssim', 'Val SSIM'), ('ncc', 'Val NCC')]):
+            ax = axes[1, col]
+            ax.plot(ep, self.history[f'val_{m}'], label='global')
+            if has_organ:
+                ax.plot(ep, self.history[f'val_org_{m}'], label='organ')
+            ax.set_title(title); ax.legend(); ax.grid(alpha=0.3)
 
         plt.tight_layout()
         plt.savefig(self.out / 'curves.png', dpi=120, bbox_inches='tight')
@@ -490,14 +565,19 @@ class Trainer:
 
             val = self._validate(val_loader)
 
-            log.info(
+            msg = (
                 f"Ep {epoch:3d}/{epochs} | "
                 f"total={avgs['gen_total']:.4f}  l1={avgs['l1']:.4f}  "
                 f"adv={avgs['adv']:.4f}  perc={avgs['perc']:.4f} | "
-                f"val_loss={val['val_loss']:.4f}  PSNR={val['val_psnr']:.2f}  "
-                f"SSIM={val['val_ssim']:.4f}  "
-                f"lr={self.opt_G.param_groups[0]['lr']:.2e}"
+                f"MAE={val['val_mae']:.4f}  PSNR={val['val_psnr']:.2f}  "
+                f"SSIM={val['val_ssim']:.4f}  NCC={val['val_ncc']:.4f}"
             )
+            if val.get('n_organ_items', 0) > 0:
+                msg += (f" | organ: MAE={val['val_org_mae']:.4f}  "
+                        f"PSNR={val['val_org_psnr']:.2f}  SSIM={val['val_org_ssim']:.4f}  "
+                        f"NCC={val['val_org_ncc']:.4f}")
+            msg += f" | lr={self.opt_G.param_groups[0]['lr']:.2e}"
+            log.info(msg)
 
             self._update_history(epoch, avgs, val)
             self._save_history()

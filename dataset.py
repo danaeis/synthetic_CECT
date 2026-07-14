@@ -241,10 +241,16 @@ class CTPairDataset(Dataset):
         self.max_focus_cand     = int(cfg.get('max_focus_candidates_per_vol', 3000))
 
         # Organ/vessel mask is only loaded from disk if a loss that consumes it
-        # is enabled OR organ-focused sampling needs it to place patch centres.
+        # is enabled, OR organ-focused sampling needs it to place patch centres,
+        # OR organ-region validation metrics are requested (val/test only — the
+        # train split never needs masks just for metric reporting, so we don't
+        # pay the extra RAM/cache there).
+        report_organ_metrics = cfg.get('report_organ_metrics', False) and \
+            split_name in ('val', 'test')
         self.load_mask = bool(cfg.get('use_organ', False)
                               or cfg.get('use_seg_consistency', False)
-                              or self.organ_focus_frac > 0.0)
+                              or self.organ_focus_frac > 0.0
+                              or report_organ_metrics)
 
         rng = np.random.default_rng(cfg.get('seed', 42))
         self._rng = rng
