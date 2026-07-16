@@ -88,6 +88,8 @@ def find_pairs_and_split(
     data_dir     = Path(cfg['data_dir'])
     target_phase = cfg.get('target_phase', 'venous')
     file_tag     = cfg.get('file_tag', '_deeds')
+    seg_suffix   = cfg.get('seg_suffix', '_seg_reg')   # e.g. '_seg_full' for the
+                                                        # regenerated full TS masks
     val_split    = cfg.get('val_split',  0.15)
     test_split   = cfg.get('test_split', 0.15)
     seed         = cfg.get('seed', 42)
@@ -130,9 +132,10 @@ def find_pairs_and_split(
 
         if 'non-contrast' in vols and target_phase in vols:
             target_path = vols[target_phase]
-            # Organ/vessel segmentation mask, co-registered to target_path by
-            # the same deeds pipeline (e.g. '..._deeds.nii.gz' -> '..._deeds_seg_reg.nii.gz').
-            seg_path = target_path.replace(f'{file_tag}.nii.gz', f'{file_tag}_seg_reg.nii.gz')
+            # Organ/vessel segmentation mask for target_path (same grid).
+            # '..._deeds.nii.gz' -> '..._deeds{seg_suffix}.nii.gz' — use
+            # '_seg_full' for the regenerated full TS masks (incl. aorta/heart/IVC).
+            seg_path = target_path.replace(f'{file_tag}.nii.gz', f'{file_tag}{seg_suffix}.nii.gz')
             pairs.append({
                 'source_path': vols['non-contrast'],
                 'target_path': target_path,
@@ -251,6 +254,14 @@ class CTPairDataset(Dataset):
                               or cfg.get('use_seg_consistency', False)
                               or self.organ_focus_frac > 0.0
                               or report_organ_metrics)
+
+        # Keep the mask MULTI-LABEL (raw TotalSegmentator ids, not binarised >0)
+        # when per-organ metrics or label-restricted organ-focus need to tell
+        # organs apart. Downstream loss consumers (OrganWeightedLoss /
+        # SegmentationConsistencyLoss) all `mask.clamp(0,1)`, so a multi-label
+        # mask still behaves as a binary foreground for them — nothing breaks.
+        self.mask_multilabel = bool(report_organ_metrics
+                                    or self.organ_focus_labels is not None)
 
         rng = np.random.default_rng(cfg.get('seed', 42))
         self._rng = rng
@@ -407,7 +418,11 @@ class CTPairDataset(Dataset):
                     try:
                         seg_vol = _load_vol(seg_path)
                         if seg_vol.shape == src_vol.shape:
-                            mp = (_crop(seg_vol, z, y, x) > 0).astype(np.float32)
+                            crop = _crop(seg_vol, z, y, x)
+                            # Multi-label: keep raw ids (for per-organ metrics /
+                            # label-restricted focus). Else binarise as before.
+                            mp = (crop if self.mask_multilabel
+                                  else (crop > 0)).astype(np.float32)
                     except Exception as e:
                         log.warning(f"  Failed to load mask {seg_path}: {e}")
                 self.mask_patches.append(mp)
@@ -521,6 +536,8 @@ class CTPairDataset(Dataset):
             'max_patches':  max_patches,
             'seed':         cfg.get('seed', 42),
             'load_mask':    self.load_mask,
+            'mask_multilabel': self.mask_multilabel,   # binary vs raw-label mask changes cached content
+            'seg_suffix':   cfg.get('seg_suffix', '_seg_reg'),  # switching mask set changes cached masks
             'split_name':   self.split_name,
         }
         # Only perturb the cache key when organ-focus is on, so existing

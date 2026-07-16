@@ -47,13 +47,15 @@ def extract_features(encoder, samples, spatial_size, batch_size, device, max_sli
     patient group for GroupKFold — the loader does NOT shuffle here.
     """
     import torch
+    from tqdm import tqdm
     loader = build_phase_loader(samples, spatial_size=spatial_size,
                                 batch_size=batch_size, augment=False,
                                 shuffle=False, hu_min=hu_min, hu_max=hu_max)
+    n_batches = -(-len(samples) // batch_size)   # ceil, for the progress total
     encoder = encoder.to(device).eval()
     feats, labels, groups = [], [], []
     with torch.no_grad():
-        for batch in loader:
+        for batch in tqdm(loader, total=n_batches, desc='Extracting features', unit='batch'):
             vol = batch['volume'].to(device)
             f = encoder(vol).cpu().numpy()
             feats.append(f)

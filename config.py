@@ -36,6 +36,10 @@ CACHE_DIR  = Path('../../simlified_train/patch_cache')
 
 # ── Data / glob ───────────────────────────────────────────────────────────────
 FILE_TAG     = '_deeds'           # suffix before .nii.gz (same as autoenc_fresh glob)
+# Organ mask suffix: '..._deeds{SEG_SUFFIX}.nii.gz'. Use '_seg_full' for the
+# regenerated full TotalSegmentator masks (CTPhase-XGBoost/run_ts_masks.sh) that
+# include the aorta/heart/IVC; '_seg_reg' is the original, vessel-incomplete set.
+SEG_SUFFIX   = '_seg_reg'
 TARGET_PHASE = 'venous'           # 'arterial' | 'venous' | 'portal' | 'delayed'
 
 # ── HU normalisation ──────────────────────────────────────────────────────────
@@ -169,6 +173,16 @@ SALIENCY_THRESHOLD   =   0.08        # only used by 'heuristic' mode
 # clinically meaningful ones — that's where the contrast enhancement lives.
 REPORT_ORGAN_METRICS = True
 
+# Per-ORGAN (not just organ-union) breakdown of the 4 metrics: computed per
+# TotalSegmentator label id present in the (now multi-label) mask, saved to
+# `organ_metrics.json` each epoch. Needs the multi-label seg masks. The id→name
+# map is read from ORGAN_LABEL_MAP_JSON (dumped by CTPhase-XGBoost/retrain_xgb.py
+# so organ names match that phase model exactly); if the file is missing, organs
+# are reported by raw label id (`label_<id>`). Set to False to skip the per-organ
+# breakdown but keep the organ-union metrics above.
+REPORT_PER_ORGAN_METRICS = True
+ORGAN_LABEL_MAP_JSON = '../CTPhase-XGBoost/retrain_out/organ_label_map.json'
+
 # ── Misc ─────────────────────────────────────────────────────────────────────
 USE_AMP              = True
 KEEP_N_CHECKPOINTS   = 3
@@ -191,6 +205,7 @@ train_config: dict = dict(
     cache_dir            = CACHE_DIR,
     # data glob
     file_tag             = FILE_TAG,
+    seg_suffix           = SEG_SUFFIX,
     target_phase         = TARGET_PHASE,
     # HU normalisation
     hu_min               = HU_MIN,
@@ -271,5 +286,7 @@ train_config: dict = dict(
     keep_last_n_sample_epochs = KEEP_N_SAMPLE_EPOCHS,
     early_stop_patience     = EARLY_STOP_PATIENCE,
     report_organ_metrics    = REPORT_ORGAN_METRICS,
+    report_per_organ_metrics = REPORT_PER_ORGAN_METRICS,
+    organ_label_map_json    = ORGAN_LABEL_MAP_JSON,
     device                  = DEVICE,
 )

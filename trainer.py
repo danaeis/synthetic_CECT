@@ -217,7 +217,29 @@ class Trainer:
             'val_org_mae', 'val_org_psnr', 'val_org_ssim', 'val_org_ncc',  # organ-region
         ]}
 
+        # Per-organ metrics: id→name map (from the CTPhase-XGBoost dump so organ
+        # names match that phase model). Missing/unset → per-organ reported by
+        # raw label id. Only active when report_per_organ_metrics is on.
+        self.per_organ = config.get('report_per_organ_metrics', False)
+        self.organ_id_to_name = self._load_organ_id_map(config.get('organ_label_map_json'))
+        self.per_organ_history: List[Dict] = []   # [{epoch, organs:{name:{mae,psnr,ssim,ncc,n_items}}}]
+
         self._log_active_losses()
+
+    # -----------------------------------------------------------------------
+    @staticmethod
+    def _load_organ_id_map(path) -> Dict[int, str]:
+        """Load {label_id: organ_name} from a {name: id} JSON (as dumped by
+        retrain_xgb.py). Returns {} on any failure — callers then fall back to
+        naming organs by their raw label id."""
+        if not path or not Path(path).exists():
+            return {}
+        try:
+            name_to_id = json.loads(Path(path).read_text())
+            return {int(v): str(k) for k, v in name_to_id.items()}
+        except Exception as e:
+            log.warning(f"could not read organ_label_map_json '{path}': {e}")
+            return {}
 
     # -----------------------------------------------------------------------
     def _log_active_losses(self):
@@ -317,7 +339,10 @@ class Trainer:
         validation items."""
         self.G.eval()
         glob = {m: [] for m in _METRICS}     # whole-patch
-        org  = {m: [] for m in _METRICS}     # organ-mask region only
+        org  = {m: [] for m in _METRICS}     # organ-mask region (union) only
+        # per-organ: {label_id: {metric: [values]}} — populated only when the
+        # multi-label mask is available and report_per_organ_metrics is on.
+        per: Dict[int, Dict[str, list]] = {}
         for batch in val_loader:
             src = batch['source'].to(self.device)
             tgt = batch['target'].to(self.device)
@@ -330,10 +355,19 @@ class Trainer:
                 for m, v in _metric_set(p, t).items():
                     glob[m].append(v)
                 if mask is not None:
-                    mk = _center_flat(mask[i]) > 0
+                    mvox = _center_flat(mask[i])
+                    mk = mvox > 0
                     if mk.sum() >= _MIN_MASK_VOXELS:
                         for m, v in _metric_set(p[mk], t[mk]).items():
                             org[m].append(v)
+                    if self.per_organ:
+                        # one metric set per distinct organ label present here
+                        for lid in np.unique(np.round(mvox[mk]).astype(int)):
+                            sel = mvox == lid
+                            if sel.sum() >= _MIN_MASK_VOXELS:
+                                d = per.setdefault(int(lid), {mm: [] for mm in _METRICS})
+                                for m, v in _metric_set(p[sel], t[sel]).items():
+                                    d[m].append(v)
         self.G.train()
 
         def _mean(xs): return float(np.mean(xs)) if xs else 0.0
@@ -346,12 +380,21 @@ class Trainer:
             'val_ssim': _mean(glob['ssim']),
             'val_ncc':  _mean(glob['ncc']),
         }
-        # Organ-region metrics: 0.0 when no masks were loaded (report_organ_metrics
-        # off, or a split without masks). `n_organ_items` disambiguates "0 because
-        # no masks" from a genuine 0 score.
+        # Organ-region (union) metrics: 0.0 when no masks were loaded.
+        # `n_organ_items` disambiguates "0 because no masks" from a genuine 0.
         for m in _METRICS:
             out[f'val_org_{m}'] = _mean(org[m])
         out['n_organ_items'] = len(org['mae'])
+
+        # Per-organ breakdown, keyed by organ name (id→name if a map was loaded).
+        if self.per_organ and per:
+            out['per_organ'] = {
+                self.organ_id_to_name.get(lid, f'label_{lid}'): {
+                    **{m: _mean(d[m]) for m in _METRICS},
+                    'n_items': len(d['mae']),
+                }
+                for lid, d in sorted(per.items())
+            }
         return out
 
     # -----------------------------------------------------------------------
@@ -482,6 +525,18 @@ class Trainer:
         with open(self.out / 'history.json', 'w') as f:
             json.dump(hist, f, indent=2)
 
+    def _record_organ_metrics(self, epoch: int, per_organ: Dict):
+        """Append this epoch's per-organ metrics and dump organ_metrics.json.
+        Logs a compact per-organ MAE line (which organs the generator does
+        best/worst on — organs missing from the mask simply don't appear)."""
+        self.per_organ_history.append({'epoch': epoch, 'organs': per_organ})
+        with open(self.out / 'organ_metrics.json', 'w') as f:
+            json.dump(self.per_organ_history, f, indent=2)
+        line = "  ".join(f"{name}: MAE={d['mae']:.3f} SSIM={d['ssim']:.3f} "
+                         f"NCC={d['ncc']:.3f}(n={d['n_items']})"
+                         for name, d in per_organ.items())
+        log.info(f"  per-organ | {line}")
+
     def _plot_history(self):
         if not self.history['epoch']:
             return
@@ -581,6 +636,8 @@ class Trainer:
 
             self._update_history(epoch, avgs, val)
             self._save_history()
+            if val.get('per_organ'):
+                self._record_organ_metrics(epoch, val['per_organ'])
             if epoch % 5 == 0 or epoch == epochs:
                 self._plot_history()
 

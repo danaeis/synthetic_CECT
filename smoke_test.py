@@ -55,7 +55,9 @@ class _FakeDataset(Dataset):
         return {
             'source': torch.rand(*self.shape),
             'target': torch.rand(*self.shape),
-            'mask':   torch.randint(0, 2, self.shape).float(),
+            # multi-label mask (ids 0-3) so both organ-union (mask>0) and the
+            # per-organ breakdown paths are exercised.
+            'mask':   torch.randint(0, 4, self.shape).float(),
         }
 
 
