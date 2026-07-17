@@ -36,10 +36,11 @@ CACHE_DIR  = Path('../../simlified_train/patch_cache')
 
 # ── Data / glob ───────────────────────────────────────────────────────────────
 FILE_TAG     = '_deeds'           # suffix before .nii.gz (same as autoenc_fresh glob)
-# Organ mask suffix: '..._deeds{SEG_SUFFIX}.nii.gz'. Use '_seg_full' for the
-# regenerated full TotalSegmentator masks (CTPhase-XGBoost/run_ts_masks.sh) that
-# include the aorta/heart/IVC; '_seg_reg' is the original, vessel-incomplete set.
-SEG_SUFFIX   = '_seg_reg'
+# Organ mask suffix: '..._deeds{SEG_SUFFIX}.nii.gz'. '_seg_full' = the
+# regenerated full TotalSegmentator masks (CTPhase-XGBoost/run_ts_masks.sh),
+# which include the aorta/heart/IVC (confirmed via retrain_out_full: OOF
+# accuracy 87.8%->97.07%, aorta coverage 0/410->410/410 vs '_seg_reg').
+SEG_SUFFIX   = '_seg_full'
 TARGET_PHASE = 'venous'           # 'arterial' | 'venous' | 'portal' | 'delayed'
 
 # ── HU normalisation ──────────────────────────────────────────────────────────
@@ -181,7 +182,9 @@ REPORT_ORGAN_METRICS = True
 # are reported by raw label id (`label_<id>`). Set to False to skip the per-organ
 # breakdown but keep the organ-union metrics above.
 REPORT_PER_ORGAN_METRICS = True
-ORGAN_LABEL_MAP_JSON = '../CTPhase-XGBoost/retrain_out/organ_label_map.json'
+# Points at the FULL-mask retrain (matches SEG_SUFFIX='_seg_full' above) — the
+# 'retrain_out' (no _full) dir predates run_ts_masks.sh and lacks this file.
+ORGAN_LABEL_MAP_JSON = '../CTPhase-XGBoost/retrain_out_full/organ_label_map.json'
 
 # ── Misc ─────────────────────────────────────────────────────────────────────
 USE_AMP              = True

@@ -76,13 +76,18 @@ class PhaseEvaluator:
         target_phase: int,
         hu_min: Optional[float] = -200.0, hu_max: Optional[float] = 400.0,
         clip_real_to_window: bool = True,
+        gen_in_hu: bool = False,
     ) -> Dict:
-        denorm = hu_min is not None and hu_max is not None
-        gen_hu = self._denorm(gen_vol, hu_min, hu_max) if denorm else gen_vol.astype(np.float64)
+        # gen_in_hu=True: the generated volume is ALREADY in HU (e.g. saved by
+        # infer_volume.py) — don't de-normalise it, but still use the window to
+        # clip the real CECT so the per-organ feature comparison stays fair.
+        window_known = hu_min is not None and hu_max is not None
+        gen_hu = (gen_vol.astype(np.float64) if (gen_in_hu or not window_known)
+                  else self._denorm(gen_vol, hu_min, hu_max))
         real_hu = real_vol.astype(np.float64)
 
         # --- A) feature comparison (same domain for both) ---
-        real_for_feat = np.clip(real_hu, hu_min, hu_max) if (denorm and clip_real_to_window) else real_hu
+        real_for_feat = np.clip(real_hu, hu_min, hu_max) if (window_known and clip_real_to_window) else real_hu
         f_gen = features_from_mask(gen_hu, mask_vol, self.organ_map)
         f_real_win = features_from_mask(real_for_feat, mask_vol, self.organ_map)
         per_organ_err = np.abs(f_gen - f_real_win)
@@ -151,7 +156,10 @@ def main():
     ap.add_argument('--hu_min', type=float, default=-200.0)
     ap.add_argument('--hu_max', type=float, default=400.0)
     ap.add_argument('--no_denorm', action='store_true',
-                    help='generated volumes are already in HU (skip [0,1]→HU)')
+                    help='drop the HU window entirely (gen already HU AND skip real clipping)')
+    ap.add_argument('--gen_in_hu', action='store_true',
+                    help="generated volumes are already in HU (e.g. from infer_volume.py) — "
+                         "keep the window to clip the real CECT for a fair feature comparison")
     args = ap.parse_args()
 
     import pandas as pd
@@ -167,7 +175,7 @@ def main():
         tp = PHASE_IDS[str(tp).lower()] if not str(tp).isdigit() else int(tp)
         try:
             r = ev.score_case_paths(row['gen_path'], row['real_path'], row['mask_path'], tp,
-                                    hu_min=hu_min, hu_max=hu_max)
+                                    hu_min=hu_min, hu_max=hu_max, gen_in_hu=args.gen_in_hu)
             r['gen_path'] = row['gen_path']
             results.append(r)
         except Exception as e:
