@@ -57,7 +57,9 @@ def load_generator(ckpt_path: str, cfg: Dict, device: str) -> UNetGenerator:
         base_channels = cfg['generator_base_channels'],
         dropout       = cfg.get('generator_dropout', 0.2),
     ).to(device)
-    state = torch.load(ckpt_path, map_location=device)
+    # weights_only=False: checkpoints also carry non-tensor state (history,
+    # early_stop, ...); we only read G_state but must be able to unpickle them.
+    state = torch.load(ckpt_path, map_location=device, weights_only=False)
     G.load_state_dict(state['G_state'])
     G.eval()
     log.info(f"Loaded generator from {ckpt_path} (epoch {state.get('epoch', '?')})")

@@ -70,28 +70,26 @@ def part_b():
     tmp = Path(tempfile.mkdtemp(prefix='infer_smoke_'))
     try:
         data = tmp / 'deeds'; data.mkdir()
-        # 4 studies so a val+test split is non-empty; each: NC + venous + venous seg
-        rows = []
+        # 4 studies so a val+test split is non-empty; each: NC + venous + venous seg.
+        # Phase is encoded in the filename ('nc'/'pv') so find_pairs_and_split uses
+        # _infer_phase and needs no labels.csv (avoids a pandas dependency in the
+        # test env; the real remote run uses the labels.csv path).
         XYZ = (48, 48, 6)   # -> _load_vol -> (D=6,H=48,W=48)
         for i in range(4):
-            st = f'study{i}'
+            st = f'case{i}'
             cdir = data / st; cdir.mkdir()
-            for ser, phase in [(f'{st}_nc', 'non-contrast'), (f'{st}_pv', 'venous')]:
+            for ser in [f'{st}_nc', f'{st}_pv']:
                 base = f'{st}_{ser}_deeds'
                 _save(cdir / f'{base}.nii.gz', np.random.uniform(-500, 500, XYZ))
-                rows.append({'StudyInstanceUID': st, 'SeriesInstanceUID': ser, 'Label': phase})
-                if phase == 'venous':   # seg_full mask only needed for the target
+                if ser.endswith('_pv'):   # seg_full mask only needed for the target
                     _save(cdir / f'{base}_seg_full.nii.gz',
                           np.random.randint(0, 5, XYZ).astype(np.float32))
-        with open(data.parent / 'labels.csv', 'w', newline='') as f:
-            w = csv.DictWriter(f, fieldnames=['StudyInstanceUID', 'SeriesInstanceUID', 'Label'])
-            w.writeheader(); w.writerows(rows)
 
         # scenario dir: run_config.json + best_model.pth
         sdir = tmp / 'scenario'; sdir.mkdir()
         cfg = dict(dims=2, patch_depth=1, patch_size=32, overlap=0.5, hu_min=-200, hu_max=400,
                    generator_base_channels=8, generator_dropout=0.0, target_phase='venous',
-                   data_dir=str(data), labels_csv=str(data.parent / 'labels.csv'),
+                   data_dir=str(data), labels_csv='',
                    file_tag='_deeds', seg_suffix='_seg_full',
                    val_split=0.25, test_split=0.25, seed=42)
         (sdir / 'run_config.json').write_text(json.dumps(cfg))

@@ -37,21 +37,34 @@ including the aorta/vessels**. (Switching `seg_suffix` invalidates the patch cac
 
 ---
 
-## Phase 1 — phase-fidelity evaluation (CRITICAL PATH)
+## Phase 1 — phase-fidelity evaluation (CRITICAL PATH) — BUILT
 
 The metric that actually validates contrast synthesis, and the only one that can
 rank `l1_only` vs `l1_adv` vs the rest on *phase correctness* rather than blur.
 
-1.1 **Volume inference script** (new — the generator only ever saw 2-D patches):
-for each val/test NCCT volume, tile 128×128 patches per slice (with overlap),
-run the trained generator, stitch (average overlaps) into a full synthetic CECT
-volume, de-normalise `[0,1]→HU`. Save as NIfTI on the NCCT grid.
-1.2 **Build the manifest** (gen_path, real_path, mask_path=`_seg_full`, target_phase)
-for the held-out cases.
-1.3 **Score** with `phase_eval.py --weights xgb_vindr_full.pkl` →
-`gen_phase_accuracy_vs_target`, `gen_agreement_with_real`, per-organ HU error.
-Run per scenario. This is the headline table row that says "does model X actually
-produce venous-phase-looking CT?"
+**Built (verified locally, `smoke_test_infer.py` 10/10):**
+- `infer_volume.py` — loads a scenario's `run_config.json` + `best_model.pth`,
+  tiles each held-out NCCT volume with the run's OWN patch geometry (batched,
+  overlap-averaged), stitches a full synthetic CECT, de-normalises `[0,1]→HU`,
+  saves NIfTI on the source grid, and writes `phase_infer/manifest.csv`. Dims-
+  parametric (2-D now, 3-D-ready — both smoke-tested).
+- `CTPhase-XGBoost/phase_eval.py` — added `--gen_in_hu`: treats the saved
+  synthetic volume as already-HU while still clipping the real CECT to the window
+  for a fair per-organ comparison. (Only the `literature_baseline/CTPhase-XGBoost`
+  copy was edited; the `phase-detection/CTPhase-XGBoost` copy still lacks it.)
+
+**Run per scenario (remote):**
+```bash
+# 1. reconstruct + manifest (GPU)
+python infer_volume.py --scenario_dir <.../literature_baseline_l1_only> --split test
+# 2. score (prints the exact command at the end of step 1)
+python CTPhase-XGBoost/phase_eval.py --weights CTPhase-XGBoost/xgb_vindr_full.pkl \
+    --manifest <scenario_dir>/phase_infer/manifest.csv --gen_in_hu \
+    --out_json <scenario_dir>/phase_infer/phase_eval_report.json
+```
+Yields `gen_phase_accuracy_vs_target`, `gen_agreement_with_real`, per-organ HU
+error — the headline "does model X actually produce venous-phase-looking CT?" row.
+Depends on Phase 0's `xgb_vindr_full.pkl` (full-mask retrain).
 
 ---
 
