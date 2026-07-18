@@ -19,8 +19,10 @@ STOP_ON_ERROR=1   # set to 0 to keep going after a scenario fails
 
 SCENARIOS=(
   "l1_only|"
-  "pix2pixhd_baseline|--use_adversarial --use_perceptual --use_feature_matching"
-  # "extra_ssim|--use_adversarial --use_perceptual --use_feature_matching --use_ssim"
+  "l1_adv| --use_adversarial"
+  "pix2pixhd_baseline|--use_adversarial --use_perceptual"
+  "pix2pixhd_baseline_feature|--use_adversarial --use_perceptual --use_feature_matching"
+  "extra_ssim|--use_adversarial --use_perceptual --use_feature_matching --use_ssim"
   # add more scenarios here, format: "name|--flag1 --flag2 ..."
 )
 

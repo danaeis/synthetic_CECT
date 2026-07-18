@@ -32,6 +32,7 @@ import pickle
 from pathlib import Path
 
 import numpy as np
+from tqdm import tqdm
 # pandas is imported lazily where used (labels/metadata CSV) so this module can
 # be imported — and the directory-discovery path tested — without it.
 
@@ -99,10 +100,11 @@ def build_feature_table_from_dir(data_dir, labels_csv, file_tag, seg_suffix, org
             phase_map.setdefault(str(r['StudyInstanceUID']), {})[str(r['SeriesInstanceUID'])] = str(r['Label']).lower()
         log.info(f"Loaded labels CSV: {len(phase_map)} studies")
 
-    organ_map = organ_map or load_organ_label_map()
-    X, y, groups, series, sources = [], [], [], [], []
-    n_no_mask = n_no_label = n_fail = 0
-
+    # --- Pass 1 (fast): collect candidate (volume, mask, phase) tuples without
+    # loading any NIfTI, so we can show a progress bar over the slow extraction. ---
+    log.info("Scanning data_dir for labelled volumes with masks …")
+    candidates = []
+    n_no_mask = n_no_label = 0
     for case_dir in sorted(data_dir.iterdir()):
         if not case_dir.is_dir():
             continue
@@ -113,30 +115,41 @@ def build_feature_table_from_dir(data_dir, labels_csv, file_tag, seg_suffix, org
             stem = f.name.replace(f'{file_tag}.nii.gz', '').replace('.nii', '')
             parts = stem.split('_')
             series_id = parts[1] if len(parts) >= 2 else stem
-
             raw = phase_map.get(case_id, {}).get(series_id)
             phase = _normalize_phase(raw) if raw is not None else _infer_phase(f.name)
             if phase is None or phase not in PHASE_TO_ID:
                 n_no_label += 1
                 continue
-
             mask_path = str(f).replace(f'{file_tag}.nii.gz', f'{file_tag}{seg_suffix}.nii.gz')
             if not Path(mask_path).exists():
                 n_no_mask += 1
                 continue
+            candidates.append((case_id, series_id, str(f), mask_path, phase))
+    log.info(f"Found {len(candidates)} candidate volumes "
+             f"(skipped no_label={n_no_label}, no_mask={n_no_mask})")
 
-            try:
-                feats = features_from_paths(str(f), mask_path, organ_map)
-            except Exception as e:
-                log.warning(f"  feature extract failed for {f.name}: {e}")
-                n_fail += 1
-                continue
-            if np.all(np.isnan(feats)):
-                n_fail += 1
-                continue
+    # Resolving the organ label map imports TotalSegmentator (heavy — can take
+    # 10-30s the first time); log it so a slow import doesn't look like a hang.
+    log.info("Resolving organ→label-id map from TotalSegmentator (importing TS may take a moment) …")
+    organ_map = organ_map or load_organ_label_map()
+    log.info(f"Resolved {len(organ_map)} organ labels; extracting per-organ features …")
 
-            X.append(feats); y.append(PHASE_TO_ID[phase])
-            groups.append(case_id); series.append(series_id); sources.append('mask')
+    # --- Pass 2 (slow): load each (CT, mask) and extract features, with a bar. ---
+    X, y, groups, series, sources = [], [], [], [], []
+    n_fail = 0
+    for case_id, series_id, vol_path, mask_path, phase in tqdm(
+            candidates, desc='Extracting organ features', unit='vol'):
+        try:
+            feats = features_from_paths(vol_path, mask_path, organ_map)
+        except Exception as e:
+            log.warning(f"  feature extract failed for {Path(vol_path).name}: {e}")
+            n_fail += 1
+            continue
+        if np.all(np.isnan(feats)):
+            n_fail += 1
+            continue
+        X.append(feats); y.append(PHASE_TO_ID[phase])
+        groups.append(case_id); series.append(series_id); sources.append('mask')
 
     log.info(f"Feature table (dir mode): {len(X)} volumes  "
              f"(no_label={n_no_label}, no_mask={n_no_mask}, failed={n_fail})")
@@ -160,7 +173,7 @@ def build_feature_table(df: pd.DataFrame, data_root: str, use_mask_fallback: boo
     X, y, groups, series, sources = [], [], [], [], []
     n_pkl = n_mask = n_drop = 0
 
-    for _, row in df.iterrows():
+    for _, row in tqdm(df.iterrows(), total=len(df), desc='Building features', unit='case'):
         feats = None
         # 1) preferred: TS statistics pickle
         sp = row.get('stats_path')
@@ -243,6 +256,16 @@ def main():
 
     out = Path(args.out_dir); out.mkdir(parents=True, exist_ok=True)
 
+    # Dump the resolved organ→label-id map — the single source of truth the
+    # synthesis per-organ metrics reuse (so their organ NAMES match this model's,
+    # with no hardcoded / drift-prone ids). Best-effort: needs TS importable.
+    try:
+        (out / 'organ_label_map.json').write_text(json.dumps(load_organ_label_map(), indent=2))
+        log.info(f"Wrote organ_label_map.json → {out}/")
+    except Exception as e:
+        log.warning(f"could not dump organ_label_map.json ({e}); synthesis per-organ "
+                    f"metrics will fall back to raw label ids")
+
     if args.data_dir:
         X, y, groups, series, sources = build_feature_table_from_dir(
             args.data_dir, args.labels_csv, args.file_tag, args.seg_suffix)
@@ -293,6 +316,34 @@ def main():
     for r in oof_conf:
         log.info(f"    {r}")
 
+    # --- Per-organ report (with organ names) ---
+    # (a) Which organs drive the classifier: mean feature importance across folds,
+    #     normalised to sum 1, mapped to organ names.
+    imp = np.mean([m['model'].feature_importances_ for m in all_models], axis=0)
+    imp = imp / (imp.sum() + 1e-12)
+    organ_importance = {o: float(v) for o, v in zip(ORGANS, imp)}
+    # (b) Descriptive per-organ median HU per phase (nan-aware) — shows the actual
+    #     enhancement signal, e.g. aorta bright in arterial vs venous.
+    import warnings
+    organ_hu_by_phase = {}
+    for pid in labels:
+        rows = X[y == pid]
+        with warnings.catch_warnings():          # nanmedian warns on all-NaN organ cols
+            warnings.simplefilter('ignore', category=RuntimeWarning)
+            med = np.nanmedian(rows, axis=0) if len(rows) else np.full(len(ORGANS), np.nan)
+        organ_hu_by_phase[PHASE_NAMES.get(pid, str(pid))] = {
+            o: (None if np.isnan(v) else float(v)) for o, v in zip(ORGANS, med)}
+    # (c) Per-organ OOF coverage: how many volumes actually had each organ
+    #     segmented (a low count means that organ's feature is mostly NaN).
+    organ_coverage = {o: int(np.sum(~np.isnan(X[:, j]))) for j, o in enumerate(ORGANS)}
+
+    log.info("Per-organ importance (mean gain across folds, top→bottom):")
+    for o, v in sorted(organ_importance.items(), key=lambda kv: -kv[1]):
+        hu = "  ".join(f"{ph[:3]}={organ_hu_by_phase[ph][o]:.0f}"
+                       if organ_hu_by_phase[ph][o] is not None else f"{ph[:3]}=NA"
+                       for ph in organ_hu_by_phase)
+        log.info(f"    {o:32s} imp={v:.3f}  cov={organ_coverage[o]:3d}/{len(y)}  medianHU[{hu}]")
+
     with open(args.out_weights, 'wb') as f:
         pickle.dump(all_models, f)
     (out / 'metrics.json').write_text(json.dumps({
@@ -301,8 +352,19 @@ def main():
         'oof_accuracy': float(oof_acc), 'oof_confusion': oof_conf,
         'oof_report': oof_report, 'fold_reports': fold_reports,
         'organs': ORGANS,
+        'organ_importance': organ_importance,
+        'organ_hu_by_phase': organ_hu_by_phase,
+        'organ_coverage': organ_coverage,
     }, indent=2))
-    log.info(f"Saved weights → {args.out_weights}; features + metrics → {out}/")
+    # A compact standalone per-organ CSV report for quick reading.
+    import pandas as pd
+    rep = pd.DataFrame({'organ': ORGANS,
+                        'importance': [organ_importance[o] for o in ORGANS],
+                        'coverage': [organ_coverage[o] for o in ORGANS]})
+    for ph in organ_hu_by_phase:
+        rep[f'medianHU_{ph}'] = [organ_hu_by_phase[ph][o] for o in ORGANS]
+    rep.sort_values('importance', ascending=False).to_csv(out / 'organ_report.csv', index=False)
+    log.info(f"Saved weights → {args.out_weights}; features + metrics + organ_report.csv → {out}/")
 
 
 if __name__ == '__main__':
