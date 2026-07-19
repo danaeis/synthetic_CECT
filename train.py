@@ -74,6 +74,10 @@ def _parse():
     p.add_argument('--organ_weight_preset', type=str, default=None,
                    choices=['tiered', 'gi_zero'],
                    help="'tiered' full scheme | 'gi_zero' control (GI excluded, rest 1.0)")
+    p.add_argument('--sample_mode', type=str, default=None, choices=['random', 'fixed'],
+                   help='val patches in the per-epoch sample grid (default random)')
+    p.add_argument('--sample_n',    type=int, default=None,
+                   help='rows in the sample grid (default 4)')
     p.add_argument('--lambda_organ',       type=float, default=None)
     p.add_argument('--lambda_l1_floor',    type=float, default=None)
     p.add_argument('--l1_decay_start_epoch', type=int, default=None)
@@ -104,7 +108,8 @@ def _apply(cfg: dict, args) -> dict:
     if args.dims        is not None: c['dims']         = args.dims
     if args.perceptual_backbone is not None: c['perceptual_backbone'] = args.perceptual_backbone
     if args.saliency_mode       is not None: c['saliency_mode']       = args.saliency_mode
-    for k in ['selection_metric', 'lambda_organ', 'lambda_l1_floor',
+    for k in ['selection_metric', 'sample_mode', 'sample_n',
+              'lambda_organ', 'lambda_l1_floor',
               'l1_decay_start_epoch', 'l1_decay_end_epoch',
               'adv_warmup_epochs', 'lr_disc']:
         v = getattr(args, k, None)
@@ -134,12 +139,22 @@ def _apply(cfg: dict, args) -> dict:
     return c
 
 
+def _ckpt_epoch(p: Path) -> int:
+    m = re.search(r'ckpt_ep(\d+)', p.name)
+    return int(m.group(1)) if m else 0
+
+
+def _resumable_ckpts(out: Path):
+    """Checkpoints newest-first. Sorted by parsed epoch number, not filename, so
+    ckpt_ep100 doesn't sort before ckpt_ep99."""
+    return sorted(out.glob('ckpt_ep*.pth'), key=_ckpt_epoch, reverse=True)
+
+
 def _latest_ckpt(out: Path):
-    ckpts = sorted(out.glob('ckpt_ep*.pth'))
+    ckpts = _resumable_ckpts(out)
     if not ckpts:
         return None, 0
-    m = re.search(r'ckpt_ep(\d+)', ckpts[-1].name)
-    return ckpts[-1], int(m.group(1)) if m else 0
+    return ckpts[0], _ckpt_epoch(ckpts[0])
 
 
 # ---------------------------------------------------------------------------
@@ -234,13 +249,36 @@ def main():
             log.info(f"--fresh: ignoring existing checkpoint {ckpt.name}, "
                      f"starting from scratch")
     elif ckpt:
-        start = trainer.load_checkpoint(str(ckpt))
-        if start >= config['epochs']:
-            log.info(f"Checkpoint epoch {start} ≥ target {config['epochs']} epochs — "
-                     f"nothing left to train. Use --epochs to extend or --fresh to restart.")
-            return
-        log.info(f"Auto-resuming from {ckpt.name}: will train epochs "
-                 f"{start + 1} → {config['epochs']}")
+        # A checkpoint truncated by an interrupted write (or a full disk) raises
+        # from torch.load — typically "PytorchStreamReader failed locating file
+        # data/N". Rather than abort the whole run, walk back to the next-newest
+        # checkpoint: keep_last_n_checkpoints normally leaves 2 older ones, so
+        # the cost of a corrupt tail is a few epochs, not the entire scenario.
+        start, used = 0, None
+        for cand in _resumable_ckpts(out):
+            try:
+                start = trainer.load_checkpoint(str(cand))
+                used = cand
+                break
+            except Exception as e:
+                bad = cand.with_suffix('.pth.corrupt')
+                log.warning(f"checkpoint {cand.name} is unreadable ({type(e).__name__}: {e}); "
+                            f"renaming to {bad.name} and trying the next-newest")
+                try:
+                    cand.rename(bad)
+                except OSError:
+                    pass
+        if used is None:
+            log.warning("no readable checkpoint in the output dir — starting fresh. "
+                        "(Any *.pth.corrupt files are the unreadable ones; a truncated "
+                        "write usually means the job was killed mid-save or the disk filled.)")
+        else:
+            if start >= config['epochs']:
+                log.info(f"Checkpoint epoch {start} ≥ target {config['epochs']} epochs — "
+                         f"nothing left to train. Use --epochs to extend or --fresh to restart.")
+                return
+            log.info(f"Auto-resuming from {used.name}: will train epochs "
+                     f"{start + 1} → {config['epochs']}")
     else:
         log.info("No checkpoint in output dir — starting fresh.")
 

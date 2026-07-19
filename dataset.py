@@ -286,9 +286,24 @@ class CTPairDataset(Dataset):
             self.tgt_patches  = list(data['tgt'])
             self.mask_patches = list(data['mask']) if self.load_mask and 'mask' in data else \
                                  ([] if self.load_mask else None)
+            # Per-patch provenance (case id + source slice), used to draw sample
+            # grids from DISTINCT cases. Deliberately NOT part of the cache key:
+            # caches written before this existed stay valid and simply yield no
+            # provenance, rather than forcing a full re-preload.
+            self.case_ids = list(data['case_id']) if 'case_id' in data else None
+            self.patch_z  = list(data['patch_z'])  if 'patch_z'  in data else None
+            if self.case_ids is None:
+                log.info(f"  [{split_name}] cache predates per-patch provenance — "
+                         f"sample grids will be random but unlabelled "
+                         f"(delete the cache to regenerate with case labels)")
             log.info(f"  [{split_name}] {len(self.src_patches)} patch pairs loaded from cache"
                      + (f"  (+ organ masks)" if self.load_mask else ""))
-            self._save_patch_grid(cfg.get('out_dir', Path('.')), split_name)
+            # 'output_dir' is the key config.py actually defines; 'out_dir' is
+            # accepted for callers (smoke tests) that pass it. Without the
+            # fallback this silently wrote every scenario's grid into the cwd,
+            # where each run overwrote the last.
+            self._save_patch_grid(cfg.get('out_dir') or cfg.get('output_dir', Path('.')),
+                                  split_name)
             return
 
         # ── Step 1: index valid coordinates ──────────────────────────────────
@@ -302,11 +317,16 @@ class CTPairDataset(Dataset):
                     if self.organ_focus_frac > 0 else "") + ") …")
 
         n_missing_seg = 0
+        # source path → case id, so the preload loop can tag each patch with the
+        # case it came from without widening the coord tuples (which are built in
+        # two places: here and _organ_centred_coords).
+        path_to_case: Dict[str, str] = {}
         for pair in pairs:
             src_path = pair['source_path']
             tgt_path = pair['target_path']
             seg_path = pair.get('seg_path')
             case_id  = pair['case_id']
+            path_to_case[src_path] = case_id
             if self.load_mask and seg_path is None:
                 n_missing_seg += 1
             try:
@@ -394,6 +414,8 @@ class CTPairDataset(Dataset):
         self.src_patches  = []
         self.tgt_patches  = []
         self.mask_patches = [] if self.load_mask else None
+        self.case_ids     = []
+        self.patch_z      = []
 
         def _crop(vol, z, y, x):
             if self.patch_depth == 1:
@@ -418,6 +440,8 @@ class CTPairDataset(Dataset):
 
             self.src_patches.append(sp)
             self.tgt_patches.append(tp)
+            self.case_ids.append(path_to_case.get(src_path, 'unknown'))
+            self.patch_z.append(int(z))
 
             if self.load_mask:
                 mp = np.zeros_like(sp)
@@ -434,13 +458,16 @@ class CTPairDataset(Dataset):
                         log.warning(f"  Failed to load mask {seg_path}: {e}")
                 self.mask_patches.append(mp)
 
-        self._save_patch_grid(cfg.get('out_dir', Path('.')), split_name)
+        self._save_patch_grid(cfg.get('out_dir') or cfg.get('output_dir', Path('.')),
+                              split_name)
         log.info(f"  [{split_name}] {len(self.src_patches)} patch pairs in RAM"
                  + (f"  (+ organ masks)" if self.load_mask else ""))
 
         if self._cache_file is not None and self.src_patches:
             self._cache_file.parent.mkdir(parents=True, exist_ok=True)
-            save_kwargs = {'src': np.stack(self.src_patches), 'tgt': np.stack(self.tgt_patches)}
+            save_kwargs = {'src': np.stack(self.src_patches), 'tgt': np.stack(self.tgt_patches),
+                           'case_id': np.array(self.case_ids),   # plain unicode array, no pickle
+                           'patch_z': np.array(self.patch_z, dtype=np.int32)}
             if self.load_mask:
                 save_kwargs['mask'] = np.stack(self.mask_patches)
             np.savez(self._cache_file, **save_kwargs)

@@ -348,6 +348,27 @@ USE_AMP              = True
 KEEP_N_CHECKPOINTS   = 3
 SAVE_SAMPLES_EVERY   = 1
 KEEP_N_SAMPLE_EPOCHS = 5
+
+# Which validation patches the per-epoch sample grid shows.
+#   'random' (default) — fresh patches each epoch, spread across as many DISTINCT
+#       validation cases as possible. Seeded by epoch, so any given epoch's grid
+#       is reproducible. Shows whether the model generalises across patients and
+#       anatomy, which one fixed batch cannot.
+#   'fixed' — the first n patches every epoch (legacy). Better for watching a
+#       single patch sharpen epoch-to-epoch, but it is one slice of one case.
+# Trade-off worth knowing: 'random' makes epoch-to-epoch comparison of the SAME
+# image impossible. The per-row PSNR/SSIM annotations and curves.png cover
+# progress tracking; the grid is for spotting failure modes.
+SAMPLE_MODE = 'random'
+SAMPLE_N    = 4
+# Upper clip of the |error| column's colour scale, in normalised [0,1] units.
+# Fixed rather than per-image autoscaled, so rows and epochs stay comparable —
+# autoscaling makes every row look equally bad and hides progress.
+# 0.15 is chosen against the measured errors on this data (global val MAE ≈0.015,
+# organ-region ≈0.031): it keeps typical tissue dark while letting the vessel/edge
+# hot spots stand out. Raise it if the map looks uniformly saturated (an untrained
+# or diverged model will peg it), lower it to bring out fine differences.
+SAMPLE_ERR_VMAX = 0.15
 EARLY_STOP_PATIENCE  = 30  # was 12: too tight for adversarial/perceptual runs — early
                            # stopping is keyed to val_loss (an L1 proxy), which is
                            # exactly what those losses trade away for realism, so a
@@ -452,6 +473,9 @@ train_config: dict = dict(
     keep_last_n_checkpoints = KEEP_N_CHECKPOINTS,
     save_samples_interval   = SAVE_SAMPLES_EVERY,
     keep_last_n_sample_epochs = KEEP_N_SAMPLE_EPOCHS,
+    sample_mode             = SAMPLE_MODE,
+    sample_n                = SAMPLE_N,
+    sample_err_vmax         = SAMPLE_ERR_VMAX,
     early_stop_patience     = EARLY_STOP_PATIENCE,
     report_organ_metrics    = REPORT_ORGAN_METRICS,
     selection_metric        = SELECTION_METRIC,

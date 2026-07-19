@@ -124,7 +124,36 @@ and is dominated by background (global PSNR runs ~3.6 dB above organ-region PSNR
 here). Now `val_org_ssim` via `_selection_score`, configurable through
 `SELECTION_METRIC`, with automatic fallback to `val_loss` when no mask exists.
 
-### 2.5 Two bugs fixed along the way
+### 2.5 Sample grids
+
+Previously `next(iter(val_loader))` on an unshuffled loader — the same 4 patches
+from the same case, every epoch, for every scenario. Now `SAMPLE_MODE='random'`
+draws fresh patches each epoch, **stratified across distinct validation cases**,
+seeded by epoch so any given grid is reproducible. Each row is labelled with case
+id + source slice and annotated with its own PSNR/SSIM, and a 4th `|error|` column
+(fixed scale 0–0.25, so rows and epochs are comparable) shows *where* the model
+fails. `SAMPLE_MODE='fixed'` restores the old behaviour.
+
+Trade-off to be aware of: random rows mean you can no longer watch one specific
+patch sharpen across epochs. `curves.png` and the per-row metrics cover progress;
+the grid is now for spotting failure modes and checking generalisation across
+patients.
+
+Per-patch provenance (`case_ids`, `patch_z`) is recorded in the dataset and
+written into new caches. It is **deliberately not in the cache key** — existing
+caches stay valid and simply produce unlabelled (still random) grids. Delete a
+cache to regenerate it with labels.
+
+### 2.6 Robustness: checkpoint writes
+
+A truncated `ckpt_*.pth` (job killed mid-save, full disk) previously aborted the
+whole scenario on resume. Now: `_atomic_save` writes to a temp file, `fsync`s,
+and `os.replace`s into position, so a checkpoint that exists is always complete;
+and the resume path walks newest→oldest, quarantining unreadable files as
+`.pth.corrupt` instead of failing. With `keep_last_n_checkpoints=3`, a corrupt
+tail costs a few epochs rather than the run.
+
+### 2.7 Two bugs fixed along the way
 
 - **Train masks were binary.** `mask_multilabel` was gated on conditions that are
   val/test-only, so the train split got a binarised mask and per-organ weights

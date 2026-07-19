@@ -12,6 +12,7 @@ it delegates all shape-awareness to the models and losses.
 import gc
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Dict, List
 
@@ -404,30 +405,104 @@ class Trainer:
         return out
 
     # -----------------------------------------------------------------------
+    def _sample_indices(self, ds, n: int, epoch: int) -> List[int]:
+        """Pick n validation patch indices to display.
+
+        'fixed'  → the first n patches, every epoch (the legacy behaviour: lets
+                   you watch one patch sharpen over epochs, but shows one slice
+                   of one case and tells you nothing about the rest).
+        'random' → n patches drawn fresh each epoch, spread over as many DISTINCT
+                   cases as possible when per-patch provenance is available.
+                   Seeded by epoch, so a given epoch's grid is reproducible.
+        """
+        n = min(n, len(ds))
+        if self.cfg.get('sample_mode', 'random') == 'fixed':
+            return list(range(n))
+
+        rng = np.random.default_rng(self.cfg.get('seed', 42) * 100003 + epoch)
+        case_ids = getattr(ds, 'case_ids', None)
+        if not case_ids:                       # old cache: plain random patches
+            return [int(i) for i in rng.choice(len(ds), n, replace=False)]
+
+        by_case: Dict[str, List[int]] = {}
+        for i, c in enumerate(case_ids):
+            by_case.setdefault(str(c), []).append(i)
+        cases = sorted(by_case)
+        rng.shuffle(cases)
+        # One patch per case first, so n distinct patients appear before any
+        # patient is shown twice; wrap around only if there are fewer cases than
+        # rows (otherwise the grid would silently under-fill).
+        picked = []
+        while len(picked) < n:
+            for c in cases:
+                if len(picked) >= n:
+                    break
+                picked.append(int(rng.choice(by_case[c])))
+        return picked
+
     def _save_samples(self, val_loader: DataLoader, epoch: int):
-        """Save (source | fake | target) grid for the first validation batch."""
+        """Save a (NCCT | generated | real CECT | abs error) grid.
+
+        Rows are drawn per `sample_mode` — by default random patches from
+        distinct validation cases each epoch, rather than the same first batch
+        forever. Each row is annotated with its case id, source slice and that
+        patch's own PSNR/SSIM, so the figure can be read on its own.
+        """
+        ds = val_loader.dataset
+        idx = self._sample_indices(ds, self.cfg.get('sample_n', 4), epoch)
+        if not idx:
+            return
+
         self.G.eval()
         with torch.no_grad():
-            batch = next(iter(val_loader))
+            batch = torch.utils.data.default_collate([ds[i] for i in idx])
             src = batch['source'].to(self.device)
             tgt = batch['target'].to(self.device)
             fake = self.G(src)
 
-        n = min(4, src.size(0))
+        n = src.size(0)
+        case_ids = getattr(ds, 'case_ids', None)
+        patch_z  = getattr(ds, 'patch_z', None)
 
         def _mid(t):
             arr = _np(t)
             return arr[arr.shape[0] // 2] if arr.ndim == 3 else arr
 
-        fig, axes = plt.subplots(n, 3, figsize=(9, 3 * n))
+        fig, axes = plt.subplots(n, 4, figsize=(12, 3 * n))
         if n == 1: axes = axes[None]
         for i in range(n):
-            for j, img in enumerate([src[i], fake[i], tgt[i]]):
-                axes[i, j].imshow(_mid(img), cmap='gray', vmin=0, vmax=1)
+            s, f, t = _mid(src[i]), _mid(fake[i]), _mid(tgt[i])
+            err = np.abs(f - t)
+            for j, (img, kw) in enumerate([
+                (s,   dict(cmap='gray', vmin=0, vmax=1)),
+                (f,   dict(cmap='gray', vmin=0, vmax=1)),
+                (t,   dict(cmap='gray', vmin=0, vmax=1)),
+                # Fixed error scale: a per-image autoscale would make every row
+                # look equally bad and hide progress across epochs.
+                (err, dict(cmap='inferno', vmin=0,
+                           vmax=self.cfg.get('sample_err_vmax', 0.15))),
+            ]):
+                ax = axes[i, j]
+                ax.imshow(img, **kw)
                 if i == 0:
-                    axes[i, j].set_title(['NCCT', 'Generated', 'CECT'][j], fontsize=9)
-                axes[i, j].axis('off')
-        plt.suptitle(f'Epoch {epoch}', fontsize=11)
+                    ax.set_title(['NCCT', 'Generated', 'Real CECT', '|error|'][j],
+                                 fontsize=9)
+                # Ticks/spines off rather than axis('off'), so the row label and
+                # the per-row metrics below still render.
+                ax.set_xticks([]); ax.set_yticks([])
+                for s in ax.spines.values():
+                    s.set_visible(False)
+            m = _metric_set(f.ravel(), t.ravel())
+            tag = f"{case_ids[idx[i]]}" if case_ids else f"patch {idx[i]}"
+            if patch_z:
+                tag += f"\nz={patch_z[idx[i]]}"
+            axes[i, 0].set_ylabel(tag, fontsize=7)
+            # Below the image, not a title — a title on row 0 collides with the
+            # '|error|' column header.
+            axes[i, 3].set_xlabel(f"PSNR {m['psnr']:.1f}   SSIM {m['ssim']:.3f}",
+                                  fontsize=8)
+        mode = self.cfg.get('sample_mode', 'random')
+        plt.suptitle(f'Epoch {epoch}  ({mode} val samples)', fontsize=11)
         plt.tight_layout()
         plt.savefig(self.samples / f'ep{epoch:03d}.png', dpi=120, bbox_inches='tight')
         plt.close()
@@ -470,16 +545,35 @@ class Trainer:
         if self.D:
             state['D_state'] = self.D.state_dict()
             state['opt_D']   = self.opt_D.state_dict()
+        # Write to a temp file and rename into place. torch.save straight to the
+        # final path leaves a truncated, unloadable .pth if the process dies
+        # mid-write (second Ctrl-C during the emergency save, OOM-kill, full
+        # disk) — rename is atomic on the same filesystem, so a checkpoint that
+        # exists is always complete.
         path = self.out / f'ckpt_ep{epoch:03d}.pth'
-        torch.save(state, path)
+        self._atomic_save(state, path)
         if is_best:
-            torch.save(state, self.out / 'best_model.pth')
+            self._atomic_save(state, self.out / 'best_model.pth')
             log.info(f"  ★ best model saved (epoch {epoch})")
         # Same mtime-not-filename reasoning as _save_samples above.
         keep = self.cfg.get('keep_last_n_checkpoints', 3)
         ckpts = sorted(self.out.glob('ckpt_ep*.pth'), key=lambda p: p.stat().st_mtime)
         for old in ckpts[:-keep]:
             old.unlink(missing_ok=True)
+
+    @staticmethod
+    def _atomic_save(state: Dict, path: Path):
+        """torch.save via a temp file + rename, so `path` is never a partial write."""
+        tmp = path.with_suffix(path.suffix + '.tmp')
+        try:
+            with open(tmp, 'wb') as f:
+                torch.save(state, f)
+                f.flush()
+                os.fsync(f.fileno())      # rename is only safe once bytes are on disk
+            os.replace(tmp, path)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
 
     def load_checkpoint(self, path: str) -> int:
         state = torch.load(path, map_location=self.device)
