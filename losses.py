@@ -328,11 +328,45 @@ class FrequencyLoss(nn.Module):
 # ---------------------------------------------------------------------------
 
 class OrganWeightedLoss(nn.Module):
-    """Mask-weighted MSE: pixels inside organ mask get organ_weight× more loss."""
+    """Mask-weighted L1, in one of two modes.
 
-    def __init__(self, organ_weight: float = 10.0):
+    Per-organ (`organ_weights` given): a {label_id: weight} lookup table, so each
+    TotalSegmentator label carries its own weight and a weight of 0 excludes that
+    anatomy from the gradient entirely. Requires a MULTI-LABEL mask (raw label
+    ids) — a binarised mask collapses every organ onto the label-1 weight.
+
+    Uniform (`organ_weights` None): the legacy behaviour — every masked voxel
+    gets `organ_weight`× the background, from a binarised mask.
+
+    L1 rather than MSE: MSE penalises large errors quadratically and so regresses
+    to the conditional mean harder than L1 does, which is precisely the blur this
+    term exists to counteract.
+    """
+
+    def __init__(
+        self,
+        organ_weight:      float = 10.0,
+        organ_weights:     Optional[Dict[int, float]] = None,
+        default_weight:    float = 1.0,
+        background_weight: float = 1.0,
+        max_label:         int = 256,
+    ):
         super().__init__()
-        self.organ_weight = organ_weight
+        self.uniform_weight = organ_weight
+        self.per_organ = bool(organ_weights)
+        if self.per_organ:
+            lut = torch.full((max_label,), float(default_weight))
+            lut[0] = float(background_weight)
+            for lid, w in organ_weights.items():
+                if not 0 <= int(lid) < max_label:
+                    raise ValueError(f"organ label id {lid} outside [0,{max_label})")
+                lut[int(lid)] = float(w)
+            if float(lut.sum()) == 0.0:
+                raise ValueError(
+                    "all organ weights are zero — the organ loss would be "
+                    "identically 0 and contribute no gradient."
+                )
+            self.register_buffer('lut', lut)
 
     def forward(
         self,
@@ -341,9 +375,16 @@ class OrganWeightedLoss(nn.Module):
         mask:   Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if mask is None:
-            return F.mse_loss(pred, target)
-        w = 1.0 + (self.organ_weight - 1.0) * mask.clamp(0, 1)
-        return (w * (pred - target) ** 2).mean()
+            return F.l1_loss(pred, target)
+        if self.per_organ:
+            w = self.lut[mask.round().long().clamp(0, self.lut.numel() - 1)]
+        else:
+            w = 1.0 + (self.uniform_weight - 1.0) * mask.clamp(0, 1)
+        # Normalise by w.sum(), not .mean(): with zero-weighted regions present a
+        # plain mean shrinks the loss as more area is excluded, which would tie
+        # the effective lambda_organ to whichever weight scheme is in use and make
+        # scenarios incomparable.
+        return (w * (pred - target).abs()).sum() / w.sum().clamp_min(1e-8)
 
 
 # ---------------------------------------------------------------------------
@@ -511,13 +552,30 @@ class CompositeLoss(nn.Module):
         # empirical evidence (scenario_results_overview.md): at a flat 100:1
         # L1:adv ratio, every adversarial-inclusive scenario converged to
         # near-identical metrics regardless of which extra losses were added.
-        _l1_competitors = ('use_adversarial', 'use_perceptual', 'use_feature_matching')
-        if any(c.get(f, True) for f in _l1_competitors):
+        # Resolve the three competitor flags ONCE, here, and reuse the resolved
+        # values both for this decision and to build the terms below. Re-reading
+        # the config dict with a different default in the two places is how the
+        # two can disagree — e.g. a loss being active while L1 stays at 100,
+        # or vice versa.
+        self.use_adv  = c.get('use_adversarial', True)
+        self.use_perc = c.get('use_perceptual', True)
+        self.use_fm   = c.get('use_feature_matching', True)
+        if self.use_adv or self.use_perc or self.use_fm:
             self.lambda_l1 = c.get('lambda_l1_reduced', 25.0)
         else:
             self.lambda_l1 = c.get('lambda_l1', 100.0)
 
-        self.use_adv    = c.get('use_adversarial', True)
+        # L1 decay curriculum: hold lambda_l1 until l1_decay_start_epoch, then
+        # ramp linearly down to lambda_l1_floor by l1_decay_end_epoch and hold.
+        # The floor is deliberately non-zero — see config.py's USE_L1_DECAY note.
+        self.use_l1_decay    = c.get('use_l1_decay', False)
+        self.l1_decay_start  = c.get('l1_decay_start_epoch', 10)
+        self.l1_decay_end    = c.get('l1_decay_end_epoch', 30)
+        self.lambda_l1_floor = c.get('lambda_l1_floor', 25.0)
+        if self.use_l1_decay and self.lambda_l1_floor > self.lambda_l1:
+            log.warning(f"lambda_l1_floor ({self.lambda_l1_floor}) > lambda_l1 "
+                        f"({self.lambda_l1}) — L1 will ramp UP, not decay.")
+
         self.lambda_adv = c.get('lambda_adv', 1.0)
         self.adv_warmup = c.get('adv_warmup_epochs', 5)
         self.adv_loss   = AdversarialLoss(mode=c.get('adv_mode', 'lsgan'))
@@ -528,7 +586,6 @@ class CompositeLoss(nn.Module):
         # neither wants it (see _get_dino_backbone below).
         self._dino_backbone = None
 
-        self.use_perc   = c.get('use_perceptual', True)
         self.lambda_perc= c.get('lambda_perceptual', 10.0)
         self.perceptual_backbone = c.get('perceptual_backbone', 'vgg')   # 'vgg' | 'dino'
         if self.use_perc:
@@ -537,7 +594,6 @@ class CompositeLoss(nn.Module):
             else:
                 self.perceptual = PerceptualLoss()
 
-        self.use_fm     = c.get('use_feature_matching', True)
         self.lambda_fm  = c.get('lambda_feature_match', 10.0)
         if self.use_fm:
             self.feat_match = FeatureMatchingLoss()
@@ -560,7 +616,12 @@ class CompositeLoss(nn.Module):
         self.use_organ  = c.get('use_organ', False)
         self.lambda_organ = c.get('lambda_organ', 5.0)
         if self.use_organ:
-            self.organ = OrganWeightedLoss(c.get('organ_weight', 10.0))
+            self.organ = OrganWeightedLoss(
+                organ_weight      = c.get('organ_weight', 10.0),
+                organ_weights     = c.get('organ_weights'),
+                default_weight    = c.get('organ_weight_default', 1.0),
+                background_weight = c.get('organ_weight_background', 1.0),
+            )
 
         self.use_sal    = c.get('use_saliency', False)
         self.lambda_sal = c.get('lambda_saliency', 5.0)
@@ -609,6 +670,14 @@ class CompositeLoss(nn.Module):
             return 0.0
         return self.lambda_cycle * min(1.0, self._epoch / max(1, self.cycle_warmup))
 
+    def _l1_w(self) -> float:
+        """Current lambda_l1 under the decay curriculum (constant if disabled)."""
+        if not self.use_l1_decay or self._epoch <= self.l1_decay_start:
+            return self.lambda_l1
+        span = max(1, self.l1_decay_end - self.l1_decay_start)
+        f = min(1.0, (self._epoch - self.l1_decay_start) / span)
+        return self.lambda_l1 + f * (self.lambda_l1_floor - self.lambda_l1)
+
     def forward(
         self,
         pred:             torch.Tensor,
@@ -624,8 +693,10 @@ class CompositeLoss(nn.Module):
         d: Dict[str, float] = {}
         total = pred.new_zeros(1).squeeze()
 
-        l1 = F.l1_loss(pred, target) * self.lambda_l1
+        _lam_l1 = self._l1_w()
+        l1 = F.l1_loss(pred, target) * _lam_l1
         d['l1'] = l1.item();  total = total + l1
+        d['lambda_l1'] = _lam_l1        # logged so the curriculum is auditable
 
         if self.use_adv and adv_fake_logits is not None:
             adv = self.adv_loss.gen_loss(adv_fake_logits) * self._adv_w()

@@ -29,7 +29,7 @@ from pathlib import Path
 
 import torch
 
-from config import train_config
+from config import train_config, resolve_organ_weights
 from dataset import build_loaders
 from trainer import Trainer
 
@@ -67,10 +67,25 @@ def _parse():
     p.add_argument('--perceptual_backbone', type=str, default=None, choices=['vgg', 'dino'])
     p.add_argument('--saliency_mode',       type=str, default=None, choices=['heuristic', 'dino'])
 
+    # Organ-weighting / curriculum knobs (see config.py for the rationale)
+    p.add_argument('--selection_metric', type=str, default=None,
+                   choices=['val_org_ssim', 'val_ssim', 'val_loss'],
+                   help='metric picking best_model.pth (default val_org_ssim)')
+    p.add_argument('--organ_weight_preset', type=str, default=None,
+                   choices=['tiered', 'gi_zero'],
+                   help="'tiered' full scheme | 'gi_zero' control (GI excluded, rest 1.0)")
+    p.add_argument('--lambda_organ',       type=float, default=None)
+    p.add_argument('--lambda_l1_floor',    type=float, default=None)
+    p.add_argument('--l1_decay_start_epoch', type=int, default=None)
+    p.add_argument('--l1_decay_end_epoch',   type=int, default=None)
+    p.add_argument('--adv_warmup_epochs',  type=int,   default=None)
+    p.add_argument('--lr_disc',            type=float, default=None)
+
     # Loss flags: --use_X / --no_X
     for flag in ['adversarial', 'perceptual', 'feature_matching',
                  'ssim', 'gradient', 'frequency',
-                 'organ', 'saliency', 'cycle', 'seg_consistency']:
+                 'organ', 'saliency', 'cycle', 'seg_consistency',
+                 'l1_decay', 'per_organ_weights']:
         g = p.add_mutually_exclusive_group()
         g.add_argument(f'--use_{flag}',  dest=f'use_{flag}', action='store_true', default=None)
         g.add_argument(f'--no_{flag}',   dest=f'use_{flag}', action='store_false')
@@ -89,12 +104,28 @@ def _apply(cfg: dict, args) -> dict:
     if args.dims        is not None: c['dims']         = args.dims
     if args.perceptual_backbone is not None: c['perceptual_backbone'] = args.perceptual_backbone
     if args.saliency_mode       is not None: c['saliency_mode']       = args.saliency_mode
+    for k in ['selection_metric', 'lambda_organ', 'lambda_l1_floor',
+              'l1_decay_start_epoch', 'l1_decay_end_epoch',
+              'adv_warmup_epochs', 'lr_disc']:
+        v = getattr(args, k, None)
+        if v is not None:
+            c[k] = v
     for flag in ['adversarial', 'perceptual', 'feature_matching',
                  'ssim', 'gradient', 'frequency',
-                 'organ', 'saliency', 'cycle', 'seg_consistency']:
+                 'organ', 'saliency', 'cycle', 'seg_consistency',
+                 'l1_decay', 'per_organ_weights']:
         v = getattr(args, f'use_{flag}', None)
         if v is not None:
             c[f'use_{flag}'] = v
+
+    # Per-organ weights are resolved from organ NAMES against the TS label map,
+    # so the LUT has to be rebuilt whenever the CLI toggles the flag.
+    if args.use_per_organ_weights is not None or args.organ_weight_preset is not None:
+        c['organ_weight_preset'] = args.organ_weight_preset or c.get('organ_weight_preset')
+        c['organ_weights'] = resolve_organ_weights(
+            enabled = args.use_per_organ_weights,
+            preset  = args.organ_weight_preset,
+        )
 
     # Auto-derive dims from patch_depth if not explicitly given
     if args.dims is None and 'patch_depth' in c:
@@ -173,6 +204,17 @@ def main():
         'organ', 'saliency', 'cycle', 'seg_consistency',
     ] if config.get(f'use_{f}')]
     log.info(f"Losses     : {' + '.join(active)}")
+    log.info(f"Selection  : {config.get('selection_metric', 'val_org_ssim')}")
+    if config.get('use_l1_decay'):
+        log.info(f"L1 decay   : {config['lambda_l1']} → {config['lambda_l1_floor']} "
+                 f"over epochs {config['l1_decay_start_epoch']}–{config['l1_decay_end_epoch']}")
+    ow = config.get('organ_weights')
+    if ow:
+        zeroed = sorted(k for k, v in ow.items() if v == 0.0)
+        log.info(f"Organ wts  : per-organ LUT over {len(ow)} labels "
+                 f"({len(zeroed)} zero-weighted: {zeroed})")
+    elif config.get('use_organ'):
+        log.info(f"Organ wts  : uniform {config.get('organ_weight')}× on masked voxels")
     log.info('')
 
     # ── Data ────────────────────────────────────────────────────────────────

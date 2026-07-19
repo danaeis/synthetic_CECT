@@ -204,11 +204,12 @@ class Trainer:
         # ── state ───────────────────────────────────────────────────────────
         self.global_step   = 0
         self.current_epoch = 0
-        self.best_val_loss = float('inf')
+        self.best_val_loss = float('inf')    # now holds _selection_score, not just MAE
         self.early_stop    = EarlyStopping(config.get('early_stop_patience', 12))
+        self._warned_selection = False
 
         self.history: Dict[str, List] = {k: [] for k in [
-            'epoch', 'lr_gen',
+            'epoch', 'lr_gen', 'lambda_l1',   # lambda_l1 varies under the decay curriculum
             'train_gen_total', 'train_l1', 'train_adv', 'train_perc', 'train_fm',
             'train_ssim', 'train_grad', 'train_freq', 'train_organ',
             'train_sal', 'train_cycle', 'train_seg', 'train_disc',
@@ -361,9 +362,14 @@ class Trainer:
                         for m, v in _metric_set(p[mk], t[mk]).items():
                             org[m].append(v)
                     if self.per_organ:
-                        # one metric set per distinct organ label present here
-                        for lid in np.unique(np.round(mvox[mk]).astype(int)):
-                            sel = mvox == lid
+                        # one metric set per distinct organ label present here.
+                        # Round once and select on the rounded array — comparing
+                        # rounded ids against raw floats (`mvox == lid`) only
+                        # worked while the mask held exact integer floats, and
+                        # would silently drop voxels under any interpolation.
+                        mvox_lbl = np.round(mvox).astype(int)
+                        for lid in np.unique(mvox_lbl[mk]):
+                            sel = mvox_lbl == lid
                             if sel.sum() >= _MIN_MASK_VOXELS:
                                 d = per.setdefault(int(lid), {mm: [] for mm in _METRICS})
                                 for m, v in _metric_set(p[sel], t[sel]).items():
@@ -450,6 +456,9 @@ class Trainer:
             'opt_G':       self.opt_G.state_dict(),
             'best_val':    self.best_val_loss,
             'history':     self.history,
+            # Without this, organ_metrics.json restarts from an empty list on
+            # resume and every pre-resume epoch's per-organ breakdown is lost.
+            'per_organ_history': self.per_organ_history,
             'early_stop':  {'best': self.early_stop.best,
                             'counter': self.early_stop.counter},
         }
@@ -498,6 +507,10 @@ class Trainer:
                 self.history = {k: list(v[:keep]) for k, v in hist.items()}
             else:
                 self.history = hist
+        if state.get('per_organ_history'):
+            ep = state.get('epoch', 0)
+            self.per_organ_history = [r for r in state['per_organ_history']
+                                      if r.get('epoch', 0) <= ep]
         es = state.get('early_stop')
         if es:
             self.early_stop.best    = es.get('best', float('inf'))
@@ -508,10 +521,38 @@ class Trainer:
         return ep
 
     # -----------------------------------------------------------------------
+    def _selection_score(self, val: Dict) -> float:
+        """Value to MINIMISE for best-checkpoint selection and early stopping.
+
+        Default is `val_org_ssim` (negated, since higher is better). The previous
+        default — global `val_loss`, i.e. whole-patch MAE — structurally favours
+        the blurriest epoch: L1-optimal predictions are the conditional mean, and
+        MAE rewards exactly that. It also scores mostly background (global PSNR
+        runs ~3.6 dB above organ-region PSNR here), so it barely discriminates on
+        the anatomy that matters. Organ-region SSIM is texture-sensitive and
+        restricted to the mask.
+
+        Falls back to `val_loss` if the organ metric is unavailable (no masks),
+        so runs without segmentation still train.
+        """
+        metric = self.cfg.get('selection_metric', 'val_org_ssim')
+        if metric == 'val_loss':
+            return float(val['val_loss'])
+        v = val.get(metric)
+        if not v:                       # missing or 0.0 → no organ voxels scored
+            if not self._warned_selection:
+                log.warning(f"selection_metric '{metric}' unavailable "
+                            f"(no organ mask?) — falling back to val_loss")
+                self._warned_selection = True
+            return float(val['val_loss'])
+        return -float(v)                # higher SSIM is better
+
+    # -----------------------------------------------------------------------
     def _update_history(self, epoch, avgs, val):
         h = self.history
         h['epoch'].append(epoch)
         h['lr_gen'].append(self.opt_G.param_groups[0]['lr'])
+        h['lambda_l1'].append(self.criterion._l1_w())
         for k in ['gen_total', 'disc', 'l1', 'adv', 'perc', 'fm',
                   'ssim', 'grad', 'freq', 'organ', 'sal', 'cycle', 'seg']:
             h[f'train_{k}'].append(avgs.get(k, 0.0))
@@ -641,15 +682,17 @@ class Trainer:
             if epoch % 5 == 0 or epoch == epochs:
                 self._plot_history()
 
-            is_best = val['val_loss'] < self.best_val_loss
+            # Model selection score, as a value to MINIMISE (see _selection_score).
+            score = self._selection_score(val)
+            is_best = score < self.best_val_loss
             if is_best:
-                self.best_val_loss = val['val_loss']
+                self.best_val_loss = score
             self._save_checkpoint(epoch, is_best)
 
             if epoch % save_every == 0:
                 self._save_samples(val_loader, epoch)
 
-            if self.early_stop.step(val['val_loss']):
+            if self.early_stop.step(score):
                 log.info(f"Early stopping at epoch {epoch}")
                 break
 

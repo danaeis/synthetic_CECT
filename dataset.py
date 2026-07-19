@@ -257,11 +257,18 @@ class CTPairDataset(Dataset):
 
         # Keep the mask MULTI-LABEL (raw TotalSegmentator ids, not binarised >0)
         # when per-organ metrics or label-restricted organ-focus need to tell
-        # organs apart. Downstream loss consumers (OrganWeightedLoss /
-        # SegmentationConsistencyLoss) all `mask.clamp(0,1)`, so a multi-label
-        # mask still behaves as a binary foreground for them — nothing breaks.
+        # organs apart. SegmentationConsistencyLoss does `mask.clamp(0,1)`, so a
+        # multi-label mask still behaves as a binary foreground for it.
+        #
+        # `organ_weights` is the reason this also has to hold on the TRAIN split:
+        # per-organ loss weights key on the raw label id, and a binarised mask
+        # would collapse every organ onto the single label-1 weight — silently
+        # applying the aorta's weight to bowel, bone and everything else. The two
+        # conditions above are val/test-only, so without this the per-organ
+        # weighting simply could not work where it matters.
         self.mask_multilabel = bool(report_organ_metrics
-                                    or self.organ_focus_labels is not None)
+                                    or self.organ_focus_labels is not None
+                                    or cfg.get('organ_weights'))
 
         rng = np.random.default_rng(cfg.get('seed', 42))
         self._rng = rng
@@ -536,7 +543,12 @@ class CTPairDataset(Dataset):
             'max_patches':  max_patches,
             'seed':         cfg.get('seed', 42),
             'load_mask':    self.load_mask,
-            'mask_multilabel': self.mask_multilabel,   # binary vs raw-label mask changes cached content
+            # Binary vs raw-label mask changes cached content. This also covers
+            # turning per-organ loss weights on/off (they flip mask_multilabel).
+            # The weight *values* are deliberately NOT in the key: they are applied
+            # in the loss, not baked into the cache, so re-tuning weights must not
+            # force a re-preload.
+            'mask_multilabel': self.mask_multilabel,
             'seg_suffix':   cfg.get('seg_suffix', '_seg_reg'),  # switching mask set changes cached masks
             'split_name':   self.split_name,
         }

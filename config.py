@@ -22,17 +22,21 @@ BASELINE LOSSES (most common in NCCT→CECT literature):
 All extra losses are off by default — toggle via use_* flags.
 """
 
+import json
 from pathlib import Path
 import torch
 
+# Repo root — used to absolute-ise paths that must resolve regardless of cwd.
+_HERE = Path(__file__).resolve().parent
+
 # ── Paths ────────────────────────────────────────────────────────────────────
-DATA_DIR   = '../../sample_data_reg/ncct_cect/vindr_ds/all_baseline_algorithms/B2_deeds__aligned'
-LABELS_CSV = '../../sample_data_reg/ncct_cect/vindr_ds/labels.csv'
-OUTPUT_DIR = Path('../../simlified_train/literature_baseline')
+DATA_DIR   = '../sample_data_reg/ncct_cect/vindr_ds/all_baseline_algorithms/B2_deeds__aligned'
+LABELS_CSV = '../sample_data_reg/ncct_cect/vindr_ds/labels.csv'
+OUTPUT_DIR = Path('../out_synthesis_train/literature_baseline')
 # Fixed, independent of OUTPUT_DIR: preloaded patches are cached here keyed by
 # data/geometry config (not loss flags), so scenario runs that only toggle
 # loss flags reuse the same cache instead of re-preloading from scratch.
-CACHE_DIR  = Path('../../simlified_train/patch_cache')
+CACHE_DIR  = Path('../out_synthesis_train/patch_cache')
 
 # ── Data / glob ───────────────────────────────────────────────────────────────
 FILE_TAG     = '_deeds'           # suffix before .nii.gz (same as autoenc_fresh glob)
@@ -143,13 +147,100 @@ USE_SEG_CONSISTENCY  = False
 LAMBDA_L1            = 100.0
 LAMBDA_L1_REDUCED    =  25.0
 LAMBDA_ADV           =   2.0
+# ── L1 decay curriculum ──────────────────────────────────────────────────────
+# Three-stage curriculum: structure (L1) → contrast (organ) → texture (adv).
+# Global L1 covers every voxel, so while it is at full strength a zero entry in
+# ORGAN_WEIGHTS is nearly a no-op — L1 still fits that region hard. Decaying L1
+# is what gives those zeros force, handing the late-training gradient budget to
+# the organ term.
+#
+# It decays to a FLOOR, never to 0, and that floor is load-bearing: the organ
+# term only sees *labelled* voxels, so background (air/fat/skin/table) and any
+# zero-weighted label have NO other constraint anywhere in the composite loss.
+# At lambda_l1=0 they would receive zero gradient for the rest of training and
+# could drift into arbitrary artefacts — invisible to every organ-region metric.
+# If the floor proves too strong for the organ term to matter, lower it to ~10,
+# but not to 0.
+USE_L1_DECAY         = False   # per-scenario switch; run_scenarios.sh sets it
+L1_DECAY_START_EPOCH =  10     # full LAMBDA_L1 up to here
+L1_DECAY_END_EPOCH   =  30     # LAMBDA_L1_FLOOR from here on
+LAMBDA_L1_FLOOR      =  25.0
 LAMBDA_PERCEPTUAL    =  10.0
 LAMBDA_FEATURE_MATCH =  10.0
 LAMBDA_SSIM          =  10.0
 LAMBDA_GRADIENT      =   5.0
 LAMBDA_FREQUENCY     =   1.0
 LAMBDA_ORGAN         =   5.0
-ORGAN_WEIGHT         =  10.0
+ORGAN_WEIGHT         =  10.0   # legacy uniform mode, used only when ORGAN_WEIGHTS is None
+
+# ── Per-organ loss weights ───────────────────────────────────────────────────
+# Rationale (measured on a sample _seg_full mask, cross-referenced against the
+# XGBoost phase model's feature importances in orgFeatXGB_CTPhase/retrain_out_full):
+#
+#   group                     voxel share   phase importance
+#   bone + muscle                  36.6%      ~0
+#   GI tract                       27.1%      ~1.3%
+#   lungs                          15.5%      ~0
+#   solid organs                   13.9%      ~33%   (liver alone 0.290)
+#   heart                           2.7%      23.5%
+#   phase-critical vessels          1.8%      ~35%   (aorta alone 0.293)
+#
+# Aorta is the single most informative structure for phase and occupies 0.91% of
+# labelled voxels — a ~30:1 mismatch between importance and loss share. Left
+# unweighted, the gradient is dominated by bowel (stochastic gas/content, not
+# inferable from NCCT) and by bone/lung (no contrast information at all), which
+# is exactly what the per-organ metrics show: the vessels have both the worst
+# SSIM and the worst HU errors (portal vein 40.3 HU, pulmonary vein 33.3 HU).
+#
+# Keyed by NAME, not id: ids are resolved through TS_LABEL_MAP_JSON at load time
+# so a TotalSegmentator version bump can't silently mis-weight organs (id 54-62,
+# for instance, are contrast-carrying vessels that a naive id-range scheme misses).
+# Unlisted labels get ORGAN_WEIGHT_DEFAULT.
+ORGAN_WEIGHT_DEFAULT    = 1.0
+ORGAN_WEIGHT_BACKGROUND = 0.5   # label 0: air/fat/skin/table
+
+_GI_TRACT = ['stomach', 'small_bowel', 'duodenum', 'colon', 'esophagus']
+
+ORGAN_WEIGHT_GROUPS = {
+    # Phase-critical vessels — tiny by volume, dominant for phase.
+    6.0: ['aorta', 'inferior_vena_cava', 'portal_vein_and_splenic_vein'],
+    4.0: ['heart', 'pulmonary_vein', 'superior_vena_cava', 'atrial_appendage_left',
+          'iliac_artery_left', 'iliac_artery_right',
+          'iliac_vena_left', 'iliac_vena_right',
+          'brachiocephalic_trunk', 'brachiocephalic_vein_left', 'brachiocephalic_vein_right',
+          'subclavian_artery_left', 'subclavian_artery_right',
+          'common_carotid_artery_left', 'common_carotid_artery_right'],
+    # Solid organs — real contrast uptake, liver is the 2nd-ranked feature.
+    3.0: ['liver'],
+    2.0: ['spleen', 'pancreas', 'kidney_left', 'kidney_right', 'gallbladder',
+          'adrenal_gland_left', 'adrenal_gland_right', 'urinary_bladder'],
+    # Contrast-free bulk — kept in the loss, just de-prioritised.
+    0.25: ['lung_upper_lobe_left', 'lung_lower_lobe_left', 'lung_upper_lobe_right',
+           'lung_middle_lobe_right', 'lung_lower_lobe_right'],
+    # GI tract — 27% of labelled voxels, ~1.3% of phase importance, and its
+    # gas/content configuration is genuinely not recoverable from NCCT. Excluded
+    # from the organ term entirely; the LAMBDA_L1_FLOOR is what still anchors it.
+    0.0: _GI_TRACT,
+}
+# Everything skeletal/muscular (vertebrae_*, rib_*, hip/femur/scapula/humerus/
+# clavicula, gluteus_*, autochthon_*, iliopsoas_*, sacrum, skull, sternum,
+# costal_cartilages) is matched by prefix rather than enumerated.
+ORGAN_WEIGHT_PREFIXES = {
+    0.25: ('vertebrae_', 'rib_', 'hip_', 'femur_', 'scapula_', 'humerus_',
+           'clavicula_', 'gluteus_', 'autochthon_', 'iliopsoas_',
+           'sacrum', 'skull', 'sternum', 'costal_cartilages'),
+}
+# Named weight schemes. 'gi_zero' is the CONTROL for the ablation: it changes
+# exactly one thing (the GI tract is excluded) and leaves everything else at 1.0.
+# If it recovers most of 'tiered's gain, the full tiered vector is unnecessary
+# complexity and the simpler intervention is the better result to report.
+ORGAN_WEIGHT_PRESETS = {
+    'tiered':  (ORGAN_WEIGHT_GROUPS, ORGAN_WEIGHT_PREFIXES),
+    'gi_zero': ({0.0: _GI_TRACT}, {}),
+}
+ORGAN_WEIGHT_PRESET = 'tiered'
+
+USE_PER_ORGAN_WEIGHTS = False   # per-scenario switch; run_scenarios.sh sets it
 LAMBDA_SALIENCY      =   5.0
 LAMBDA_CYCLE         =  10.0
 LAMBDA_SEG           =   2.0
@@ -174,6 +265,14 @@ SALIENCY_THRESHOLD   =   0.08        # only used by 'heuristic' mode
 # clinically meaningful ones — that's where the contrast enhancement lives.
 REPORT_ORGAN_METRICS = True
 
+# Metric used to pick `best_model.pth` and drive early stopping.
+# 'val_org_ssim' (default) | 'val_ssim' | 'val_loss' (legacy global MAE).
+# The legacy 'val_loss' is whole-patch MAE, which structurally selects the
+# blurriest epoch — L1-optimal output IS the conditional mean — and is dominated
+# by background (global PSNR runs ~3.6 dB above organ-region PSNR on this data).
+# Falls back to val_loss automatically when no organ mask is available.
+SELECTION_METRIC = 'val_org_ssim'
+
 # Per-ORGAN (not just organ-union) breakdown of the 4 metrics: computed per
 # TotalSegmentator label id present in the (now multi-label) mask, saved to
 # `organ_metrics.json` each epoch. Needs the multi-label seg masks. The id→name
@@ -182,9 +281,67 @@ REPORT_ORGAN_METRICS = True
 # are reported by raw label id (`label_<id>`). Set to False to skip the per-organ
 # breakdown but keep the organ-union metrics above.
 REPORT_PER_ORGAN_METRICS = True
-# Points at the FULL-mask retrain (matches SEG_SUFFIX='_seg_full' above) — the
-# 'retrain_out' (no _full) dir predates run_ts_masks.sh and lacks this file.
-ORGAN_LABEL_MAP_JSON = '../CTPhase-XGBoost/retrain_out_full/organ_label_map.json'
+# The FULL 117-class TotalSegmentator map, written by
+# `orgFeatXGB_CTPhase/dump_ts_label_map.py`. NOT the same file as the XGBoost's
+# organ_label_map.json — that one is deliberately restricted to the 16 organs the
+# phase model consumes (in its trained feature order), so it names only 16 of the
+# ~79 labels present in a _seg_full mask and can't be used to build the weight LUT.
+#
+# Absolute-ised against this file's location: the previous value was relative and
+# silently resolved to nothing whenever the process cwd wasn't the repo root,
+# which is why every per-organ metric so far is named `label_<id>`.
+TS_LABEL_MAP_JSON = str(_HERE / 'orgFeatXGB_CTPhase' / 'retrain_out_full' / 'ts_label_map_total.json')
+ORGAN_LABEL_MAP_JSON = TS_LABEL_MAP_JSON
+
+
+def resolve_organ_weights(enabled: bool = None, preset: str = None):
+    """Build {label_id: weight} from the name-keyed groups above.
+
+    Returns None when per-organ weighting is off (→ legacy uniform ORGAN_WEIGHT).
+    Raises on an unknown organ name so a TotalSegmentator version mismatch fails
+    loudly here rather than silently weighting the wrong anatomy.
+
+    `enabled`/`preset` override USE_PER_ORGAN_WEIGHTS / ORGAN_WEIGHT_PRESET
+    (train.py passes the CLI flags).
+    """
+    if not (USE_PER_ORGAN_WEIGHTS if enabled is None else enabled):
+        return None
+    preset = preset or ORGAN_WEIGHT_PRESET
+    if preset not in ORGAN_WEIGHT_PRESETS:
+        raise KeyError(f"unknown organ weight preset '{preset}' — "
+                       f"choose from {sorted(ORGAN_WEIGHT_PRESETS)}")
+    groups, prefix_rules = ORGAN_WEIGHT_PRESETS[preset]
+
+    p = Path(TS_LABEL_MAP_JSON)
+    if not p.exists():
+        raise FileNotFoundError(
+            f"per-organ loss weights need the full TS label map, missing at {p}. "
+            f"Generate it with: python orgFeatXGB_CTPhase/dump_ts_label_map.py"
+        )
+    name_to_id = json.loads(p.read_text())
+
+    weights, unknown = {}, []
+    for w, names in groups.items():
+        for n in names:
+            if n not in name_to_id:
+                unknown.append(n)
+            else:
+                weights[int(name_to_id[n])] = float(w)
+    if unknown:
+        raise KeyError(
+            f"organ names in preset '{preset}' absent from {p.name}: {unknown}. "
+            f"Your TotalSegmentator version differs from the one the weights were "
+            f"written for — check the names with dump_ts_label_map.py."
+        )
+    # Prefix rules apply only to labels no explicit group already claimed.
+    for w, prefixes in prefix_rules.items():
+        for n, i in name_to_id.items():
+            if int(i) not in weights and n.startswith(tuple(prefixes)):
+                weights[int(i)] = float(w)
+    return weights
+
+
+ORGAN_WEIGHTS = resolve_organ_weights()
 
 # ── Misc ─────────────────────────────────────────────────────────────────────
 USE_AMP              = True
@@ -264,6 +421,10 @@ train_config: dict = dict(
     # loss weights
     lambda_l1            = LAMBDA_L1,
     lambda_l1_reduced    = LAMBDA_L1_REDUCED,
+    use_l1_decay         = USE_L1_DECAY,
+    l1_decay_start_epoch = L1_DECAY_START_EPOCH,
+    l1_decay_end_epoch   = L1_DECAY_END_EPOCH,
+    lambda_l1_floor      = LAMBDA_L1_FLOOR,
     lambda_adv           = LAMBDA_ADV,
     lambda_perceptual    = LAMBDA_PERCEPTUAL,
     lambda_feature_match = LAMBDA_FEATURE_MATCH,
@@ -272,6 +433,10 @@ train_config: dict = dict(
     lambda_frequency     = LAMBDA_FREQUENCY,
     lambda_organ         = LAMBDA_ORGAN,
     organ_weight         = ORGAN_WEIGHT,
+    organ_weights            = ORGAN_WEIGHTS,          # None → legacy uniform mode
+    organ_weight_preset      = ORGAN_WEIGHT_PRESET,
+    organ_weight_default     = ORGAN_WEIGHT_DEFAULT,
+    organ_weight_background  = ORGAN_WEIGHT_BACKGROUND,
     lambda_saliency      = LAMBDA_SALIENCY,
     lambda_cycle         = LAMBDA_CYCLE,
     lambda_seg           = LAMBDA_SEG,
@@ -289,6 +454,7 @@ train_config: dict = dict(
     keep_last_n_sample_epochs = KEEP_N_SAMPLE_EPOCHS,
     early_stop_patience     = EARLY_STOP_PATIENCE,
     report_organ_metrics    = REPORT_ORGAN_METRICS,
+    selection_metric        = SELECTION_METRIC,
     report_per_organ_metrics = REPORT_PER_ORGAN_METRICS,
     organ_label_map_json    = ORGAN_LABEL_MAP_JSON,
     device                  = DEVICE,
