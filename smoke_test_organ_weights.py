@@ -96,6 +96,25 @@ def test_decay_schedule():
     C2.set_epoch(80)
     check(C2._l1_w() == 100.0, "decay disabled → lambda_l1 constant")
 
+    # REGRESSION: l1_adv_organ silently trained with a flat lambda_l1=25 for all
+    # 65 epochs. use_adversarial pinned the start to lambda_l1_reduced (25), the
+    # floor was also 25, so the curriculum ran 25→25. The whole suite passed while
+    # this was live because nothing exercised decay + adversarial together.
+    C3 = CompositeLoss(dict(cfg, use_adversarial=True))
+    check(C3.lambda_l1 == 100.0,
+          f"decay+adversarial starts from FULL lambda_l1, not reduced "
+          f"(got {C3.lambda_l1})")
+    trace = []
+    for e in (0, 10, 20, 30, 40):
+        C3.set_epoch(e); trace.append(round(C3._l1_w(), 2))
+    check(len(set(trace)) > 1 and trace[0] == 100.0 and trace[-1] == 25.0,
+          f"decay+adversarial actually decays 100→25, not flat (got {trace})")
+
+    # Without the decay, adversarial must still get the static reduction.
+    C4 = CompositeLoss(dict(cfg, use_adversarial=True, use_l1_decay=False))
+    check(C4.lambda_l1 == 25.0,
+          f"adversarial WITHOUT decay still uses lambda_l1_reduced (got {C4.lambda_l1})")
+
 
 def test_train_split_is_multilabel():
     print("5. train-split masks are MULTI-LABEL when organ_weights is set")
@@ -163,9 +182,56 @@ def test_zero_region_still_anchored():
     check('lambda_l1' in d, "lambda_l1 logged in the loss dict for auditing")
 
 
+def test_hu_profile_loss():
+    print("7. organ HU-profile loss")
+    from losses import OrganHUProfileLoss
+    w = resolve_organ_weights(enabled=True, preset='tiered')
+    L = OrganHUProfileLoss(organ_weights=w)
+
+    mask = torch.zeros(1, 1, 8, 8)
+    mask[..., :4, :] = AORTA       # weight 6
+    mask[..., 4:, :] = BOWEL       # weight 0
+
+    # Same organ MEANS but wildly different texture → this term must be ~0.
+    # That is the defining property: it constrains level, not appearance.
+    torch.manual_seed(0)
+    tgt = torch.full((1, 1, 8, 8), 0.5)
+    pred = tgt.clone()
+    noise = torch.randn(1, 1, 4, 8) * 0.2
+    pred[..., :4, :] = 0.5 + (noise - noise.mean())      # mean preserved exactly
+    check(float(L(pred, tgt, mask)) < 1e-5,
+          f"texture differs but organ means match → ~0 (got {float(L(pred,tgt,mask)):.2e})")
+
+    # A constant offset inside a weighted organ → exactly that offset.
+    # Weights normalise out when only one organ contributes.
+    pred = tgt.clone(); pred[..., :4, :] += 0.10
+    got = float(L(pred, tgt, mask))
+    check(abs(got - 0.10) < 1e-6, f"0.10 offset in aorta → 0.10 (got {got:.6f})")
+
+    # An offset in a ZERO-weighted organ must be ignored entirely.
+    pred = tgt.clone(); pred[..., 4:, :] += 0.50
+    check(float(L(pred, tgt, mask)) == 0.0,
+          f"0.50 offset in zero-weighted bowel → 0 (got {float(L(pred,tgt,mask)):.6f})")
+
+    # Gradient must reach the weighted organ and not the zero-weighted one.
+    p = tgt.clone().requires_grad_(True)
+    L(p, tgt + 0.1, mask).backward()
+    g = p.grad[0, 0]
+    check(float(g[:4].abs().sum()) > 0 and float(g[4:].abs().sum()) == 0.0,
+          "gradient flows to aorta only, not bowel")
+
+    # Organs below min_voxels are skipped rather than contributing a noisy mean.
+    tiny = torch.zeros(1, 1, 8, 8); tiny[..., 0, :3] = AORTA     # 3 voxels < 16
+    check(float(L(tgt + 0.2, tgt, tiny)) == 0.0, "organ below min_voxels skipped")
+
+    # No mask → no-op (must not silently fall back to a global term).
+    check(float(L(tgt + 0.3, tgt, None)) == 0.0, "no mask → 0")
+
+
 def main():
     for t in (test_lut_weighting, test_all_zero_guard, test_decay_schedule,
-              test_train_split_is_multilabel, test_zero_region_still_anchored):
+              test_train_split_is_multilabel, test_zero_region_still_anchored,
+              test_hu_profile_loss):
         t()
     print("\nOrgan-weighting smoke check " + ("PASSED." if _ok else "FAILED."))
     return 0 if _ok else 1

@@ -34,19 +34,52 @@ def _pool(dims):       return getattr(nn, f'MaxPool{dims}d')
 def _drop(dims):       return getattr(nn, f'Dropout{dims}d')
 
 
+NORM_KINDS = ('instance', 'group', 'batch')
+
+
+def _norm(dims: int, ch: int, kind: str = 'instance') -> nn.Module:
+    """Normalisation layer, selectable because the choice decides whether a
+    patch-based generator can tile seamlessly.
+
+      instance — normalises each sample by ITS OWN spatial mean/std. Two
+                 overlapping tiles covering the same voxel therefore apply two
+                 different, content-dependent affine transforms to it, and the
+                 disagreement is a DC offset that overlap-blending cannot cancel.
+                 This is the default only because it is what the existing runs
+                 were trained with; `norm_attribution.py` measures the cost.
+      group    — normalises over channel groups within a sample. Still
+                 sample-dependent, but far less sensitive to the tile's overall
+                 intensity than per-channel spatial statistics.
+      batch    — at eval() applies FIXED running statistics, so the transform is
+                 completely independent of tile content. The only option here
+                 that is tile-invariant by construction.
+
+    Instance/batch are dims-specific; GroupNorm is dims-agnostic and works for
+    both 2-D and 3-D unchanged.
+    """
+    if kind == 'instance':
+        return _inorm(dims)(ch)
+    if kind == 'batch':
+        return _bnorm(dims)(ch)
+    if kind == 'group':
+        # 8 groups where possible; must divide ch (all channel counts here are
+        # powers of two, so this holds for ch >= 8).
+        return nn.GroupNorm(min(8, ch) if ch % min(8, ch) == 0 else 1, ch)
+    raise ValueError(f'unknown norm kind {kind!r}; expected one of {NORM_KINDS}')
+
+
 # ---------------------------------------------------------------------------
 # U-Net building blocks (shared by 2-D and 3-D)
 # ---------------------------------------------------------------------------
 
 class _EncBlock(nn.Module):
-    def __init__(self, dims, in_ch, out_ch, dropout=0.0):
+    def __init__(self, dims, in_ch, out_ch, dropout=0.0, norm='instance'):
         super().__init__()
         Conv  = _conv(dims)
-        Norm  = _inorm(dims)
         Drop  = _drop(dims)
         layers = [
-            Conv(in_ch, out_ch, 3, padding=1), Norm(out_ch), nn.LeakyReLU(0.2, inplace=True),
-            Conv(out_ch, out_ch, 3, padding=1), Norm(out_ch), nn.LeakyReLU(0.2, inplace=True),
+            Conv(in_ch, out_ch, 3, padding=1), _norm(dims, out_ch, norm), nn.LeakyReLU(0.2, inplace=True),
+            Conv(out_ch, out_ch, 3, padding=1), _norm(dims, out_ch, norm), nn.LeakyReLU(0.2, inplace=True),
         ]
         if dropout > 0:
             layers.append(Drop(dropout))
@@ -57,15 +90,14 @@ class _EncBlock(nn.Module):
 
 
 class _DecBlock(nn.Module):
-    def __init__(self, dims, in_ch, out_ch, dropout=0.2):
+    def __init__(self, dims, in_ch, out_ch, dropout=0.2, norm='instance'):
         super().__init__()
         Conv = _conv(dims)
-        Norm = _inorm(dims)
         Drop = _drop(dims)
         self.block = nn.Sequential(
-            Conv(in_ch, out_ch, 3, padding=1), Norm(out_ch), nn.LeakyReLU(0.2, inplace=True),
+            Conv(in_ch, out_ch, 3, padding=1), _norm(dims, out_ch, norm), nn.LeakyReLU(0.2, inplace=True),
             Drop(dropout),
-            Conv(out_ch, out_ch, 3, padding=1), Norm(out_ch), nn.LeakyReLU(0.2, inplace=True),
+            Conv(out_ch, out_ch, 3, padding=1), _norm(dims, out_ch, norm), nn.LeakyReLU(0.2, inplace=True),
         )
 
     def forward(self, x):
@@ -101,9 +133,11 @@ class UNetGenerator(nn.Module):
         base_channels: int = 64,
         dropout:       float = 0.2,
         pool_stride    = None,
+        norm:          str = 'instance',
     ):
         super().__init__()
         self.dims = dims
+        self.norm = norm
         ch  = base_channels
         bn  = ch * 8                   # bottleneck channels
 
@@ -117,33 +151,32 @@ class UNetGenerator(nn.Module):
             stride = pool_stride if pool_stride is not None else (1, 2, 2)
 
         # Encoder
-        self.enc1 = _EncBlock(dims, 1,    ch,     dropout=0.0)
-        self.enc2 = _EncBlock(dims, ch,   ch * 2, dropout=0.0)
-        self.enc3 = _EncBlock(dims, ch*2, ch * 4, dropout=0.0)
-        self.enc4 = _EncBlock(dims, ch*4, ch * 8, dropout=0.0)
+        self.enc1 = _EncBlock(dims, 1,    ch,     dropout=0.0, norm=norm)
+        self.enc2 = _EncBlock(dims, ch,   ch * 2, dropout=0.0, norm=norm)
+        self.enc3 = _EncBlock(dims, ch*2, ch * 4, dropout=0.0, norm=norm)
+        self.enc4 = _EncBlock(dims, ch*4, ch * 8, dropout=0.0, norm=norm)
         Pool = _pool(dims)
         self.pool = Pool(kernel_size=stride, stride=stride)
 
         # Bottleneck
         Drop = _drop(dims)
-        Norm = _inorm(dims)
         self.bottleneck = nn.Sequential(
-            Conv(bn, bn, 3, padding=1), Norm(bn), nn.LeakyReLU(0.2, inplace=True), Drop(dropout),
-            Conv(bn, bn, 3, padding=1), Norm(bn), nn.LeakyReLU(0.2, inplace=True), Drop(dropout),
+            Conv(bn, bn, 3, padding=1), _norm(dims, bn, norm), nn.LeakyReLU(0.2, inplace=True), Drop(dropout),
+            Conv(bn, bn, 3, padding=1), _norm(dims, bn, norm), nn.LeakyReLU(0.2, inplace=True), Drop(dropout),
         )
 
         # Decoder (stride matches pool)
         self.up4 = ConvT(bn,   ch*4, kernel_size=stride, stride=stride)
-        self.dec4 = _DecBlock(dims, ch*4 + ch*8, ch*4, dropout)
+        self.dec4 = _DecBlock(dims, ch*4 + ch*8, ch*4, dropout, norm=norm)
 
         self.up3 = ConvT(ch*4, ch*2, kernel_size=stride, stride=stride)
-        self.dec3 = _DecBlock(dims, ch*2 + ch*4, ch*2, dropout)
+        self.dec3 = _DecBlock(dims, ch*2 + ch*4, ch*2, dropout, norm=norm)
 
         self.up2 = ConvT(ch*2, ch,   kernel_size=stride, stride=stride)
-        self.dec2 = _DecBlock(dims, ch + ch*2, ch, dropout)
+        self.dec2 = _DecBlock(dims, ch + ch*2, ch, dropout, norm=norm)
 
         self.up1 = ConvT(ch,   ch,   kernel_size=stride, stride=stride)
-        self.dec1 = _DecBlock(dims, ch + ch, ch, dropout)
+        self.dec1 = _DecBlock(dims, ch + ch, ch, dropout, norm=norm)
 
         # Sigmoid, not Tanh: dataset normalises HU -> [0, 1] (see dataset.py),
         # so the output range must match. Tanh's [-1, 1] range wastes its
@@ -153,7 +186,7 @@ class UNetGenerator(nn.Module):
 
         n = sum(p.numel() for p in self.parameters()) / 1e6
         log.info(f"UNetGenerator | dims={dims} | base_ch={base_channels} | "
-                 f"pool_stride={stride} | {n:.2f}M params")
+                 f"pool_stride={stride} | norm={norm} | {n:.2f}M params")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         e1 = self.enc1(x)

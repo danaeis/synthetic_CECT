@@ -65,6 +65,68 @@ def part_a():
     return ok
 
 
+class _Identity(torch.nn.Module):
+    """Stand-in generator that returns its input unchanged."""
+    def forward(self, x):
+        return x
+
+
+def part_c():
+    """Blending correctness.
+
+    The invariant that matters: with an identity generator, blending must
+    reconstruct the input EXACTLY. Sum(w*x)/Sum(w) == x for any weights, so any
+    deviation means the weight and value accumulators disagree — a mis-indexed
+    window, a window applied to one and not the other, or a coverage hole. This
+    catches the whole class of stitching bugs that a shape/NaN check cannot.
+    """
+    ok = True
+    hu_min, hu_max = -200.0, 400.0
+    G = _Identity().eval()
+    # Values inside the HU window so the clip is a no-op and round-trip is exact.
+    vol = np.random.uniform(hu_min + 10, hu_max - 10, size=(4, 96, 96)).astype(np.float32)
+
+    for mode in ('uniform', 'hann', 'gaussian'):
+        cfg = dict(dims=2, patch_depth=1, patch_size=32, overlap=0.5,
+                   hu_min=hu_min, hu_max=hu_max)
+        syn = infer_volume(G, vol, cfg, device='cpu', batch_size=8, blend=mode)
+        err = float(np.abs(syn - vol).max())
+        ok &= check(err < 0.05, f'blend={mode}: identity round-trip exact',
+                    f'max err {err:.4f} HU')
+
+    # Edge margin must still cover every voxel, including the volume's own shell.
+    cfg = dict(dims=2, patch_depth=1, patch_size=32, overlap=0.5,
+               hu_min=hu_min, hu_max=hu_max)
+    syn = infer_volume(G, vol, cfg, device='cpu', batch_size=8,
+                       blend='hann', edge_margin=8)
+    err = float(np.abs(syn - vol).max())
+    ok &= check(not np.isnan(syn).any() and err < 0.05,
+                'edge_margin=8: full coverage incl. volume border', f'max err {err:.4f} HU')
+
+    # Inference-time overlap override changes the tiling, not the result.
+    syn = infer_volume(G, vol, cfg, device='cpu', batch_size=8,
+                       blend='hann', overlap=0.75)
+    ok &= check(float(np.abs(syn - vol).max()) < 0.05,
+                'overlap override: still exact')
+
+    # 3-D path with weighting.
+    cfg3 = dict(dims=3, patch_depth=4, patch_size=32, overlap=0.5,
+                hu_min=hu_min, hu_max=hu_max)
+    vol3 = np.random.uniform(hu_min + 10, hu_max - 10, size=(8, 32, 32)).astype(np.float32)
+    syn3 = infer_volume(G, vol3, cfg3, device='cpu', batch_size=4, blend='hann')
+    ok &= check(float(np.abs(syn3 - vol3).max()) < 0.05, '3D: weighted blend exact')
+
+    # A tapered window must actually taper, or 'hann' is silently 'uniform'.
+    from infer_volume import _axis_window
+    w_int = _axis_window(32, 'hann', 0, at_lo=False, at_hi=False)
+    ok &= check(w_int[0] < 0.05 * w_int.max() and w_int[0] > 0,
+                'hann window tapers at tile edge but stays > 0', f'w[0]={w_int[0]:.5f}')
+    w_edge = _axis_window(32, 'hann', 8, at_lo=True, at_hi=False)
+    ok &= check(w_edge[0] > 0 and w_edge[-1] == 0,
+                'margin skipped on the volume-boundary side only')
+    return ok
+
+
 def part_b():
     ok = True
     tmp = Path(tempfile.mkdtemp(prefix='infer_smoke_'))
@@ -126,7 +188,9 @@ def main():
     a = part_a()
     print("\n--- Part B: run() driver end-to-end ---")
     b = part_b()
-    ok = a and b
+    print("\n--- Part C: overlap blending correctness ---")
+    c = part_c()
+    ok = a and b and c
     print(f"\n{'ALL PASS' if ok else 'SOME FAILED'}")
     sys.exit(0 if ok else 1)
 

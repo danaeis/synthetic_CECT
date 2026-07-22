@@ -36,7 +36,18 @@ SCENARIOS=(
   "l1_organ_curriculum|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay"
   # C: the adversarial branch was not worse, it destabilised (best ep27, then
   # decayed). Longer warmup + slower discriminator, on top of A.
+  # NOTE: the first l1_adv_organ run trained with a FLAT lambda_l1=25 — the decay
+  # was a no-op because adversarial pinned the start to lambda_l1_reduced (25),
+  # which equalled the floor. Fixed in losses.py; re-run to get the real curriculum.
   "l1_adv_organ|--use_adversarial --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --adv_warmup_epochs 15 --lr_disc 5e-5"
+
+  # D: HU-profile loss on top of A. The measured win from tiered weighting was in
+  # per-organ HU error (-1.58 HU, t=-4.22), which is exactly what the XGBoost
+  # phase model reads — so optimise it directly instead of as a side effect.
+  "l1_organ_huprofile|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --use_hu_profile"
+  # E: HU-profile without the per-voxel organ term — isolates how much of the
+  # gain is the LEVEL constraint vs the texture weighting.
+  "l1_huprofile_only|--use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --use_hu_profile"
   # add more scenarios here, format: "name|--flag1 --flag2 ..."
 )
 

@@ -153,6 +153,7 @@ class Trainer:
             dims          = dims,
             base_channels = config['generator_base_channels'],
             dropout       = config.get('generator_dropout', 0.2),
+            norm          = config.get('generator_norm', 'instance'),
         ).to(self.device)
 
         self.use_adv = config.get('use_adversarial', True)
@@ -212,7 +213,7 @@ class Trainer:
         self.history: Dict[str, List] = {k: [] for k in [
             'epoch', 'lr_gen', 'lambda_l1',   # lambda_l1 varies under the decay curriculum
             'train_gen_total', 'train_l1', 'train_adv', 'train_perc', 'train_fm',
-            'train_ssim', 'train_grad', 'train_freq', 'train_organ',
+            'train_ssim', 'train_grad', 'train_freq', 'train_organ', 'train_hu_profile',
             'train_sal', 'train_cycle', 'train_seg', 'train_disc',
             'val_loss',
             'val_mae', 'val_psnr', 'val_ssim', 'val_ncc',              # global
@@ -247,7 +248,7 @@ class Trainer:
     def _log_active_losses(self):
         flags = ['adversarial', 'perceptual', 'feature_matching',
                  'ssim', 'gradient', 'frequency',
-                 'organ', 'saliency', 'cycle', 'seg_consistency']
+                 'organ', 'hu_profile', 'saliency', 'cycle', 'seg_consistency']
         active = ['L1'] + [f for f in flags if self.cfg.get(f'use_{f}')]
         log.info(f"Active losses: {' + '.join(active)}")
         log.info(f"Dims: {self.cfg.get('dims', 2)}-D  |  "
@@ -328,6 +329,7 @@ class Trainer:
             'grad':      ld.get('gradient', 0),
             'freq':      ld.get('frequency', 0),
             'organ':     ld.get('organ', 0),
+            'hu_profile': ld.get('hu_profile', 0),
             'sal':       ld.get('saliency', 0),
             'cycle':     ld.get('cycle', 0),
             'seg':       ld.get('seg_consistency', 0),
@@ -648,7 +650,7 @@ class Trainer:
         h['lr_gen'].append(self.opt_G.param_groups[0]['lr'])
         h['lambda_l1'].append(self.criterion._l1_w())
         for k in ['gen_total', 'disc', 'l1', 'adv', 'perc', 'fm',
-                  'ssim', 'grad', 'freq', 'organ', 'sal', 'cycle', 'seg']:
+                  'ssim', 'grad', 'freq', 'organ', 'hu_profile', 'sal', 'cycle', 'seg']:
             h[f'train_{k}'].append(avgs.get(k, 0.0))
         for k in ['val_loss',
                   'val_mae', 'val_psnr', 'val_ssim', 'val_ncc',

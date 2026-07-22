@@ -79,6 +79,7 @@ def _parse():
     p.add_argument('--sample_n',    type=int, default=None,
                    help='rows in the sample grid (default 4)')
     p.add_argument('--lambda_organ',       type=float, default=None)
+    p.add_argument('--lambda_hu_profile',  type=float, default=None)
     p.add_argument('--lambda_l1_floor',    type=float, default=None)
     p.add_argument('--l1_decay_start_epoch', type=int, default=None)
     p.add_argument('--l1_decay_end_epoch',   type=int, default=None)
@@ -89,7 +90,7 @@ def _parse():
     for flag in ['adversarial', 'perceptual', 'feature_matching',
                  'ssim', 'gradient', 'frequency',
                  'organ', 'saliency', 'cycle', 'seg_consistency',
-                 'l1_decay', 'per_organ_weights']:
+                 'l1_decay', 'per_organ_weights', 'hu_profile']:
         g = p.add_mutually_exclusive_group()
         g.add_argument(f'--use_{flag}',  dest=f'use_{flag}', action='store_true', default=None)
         g.add_argument(f'--no_{flag}',   dest=f'use_{flag}', action='store_false')
@@ -109,7 +110,7 @@ def _apply(cfg: dict, args) -> dict:
     if args.perceptual_backbone is not None: c['perceptual_backbone'] = args.perceptual_backbone
     if args.saliency_mode       is not None: c['saliency_mode']       = args.saliency_mode
     for k in ['selection_metric', 'sample_mode', 'sample_n',
-              'lambda_organ', 'lambda_l1_floor',
+              'lambda_organ', 'lambda_hu_profile', 'lambda_l1_floor',
               'l1_decay_start_epoch', 'l1_decay_end_epoch',
               'adv_warmup_epochs', 'lr_disc']:
         v = getattr(args, k, None)
@@ -118,7 +119,7 @@ def _apply(cfg: dict, args) -> dict:
     for flag in ['adversarial', 'perceptual', 'feature_matching',
                  'ssim', 'gradient', 'frequency',
                  'organ', 'saliency', 'cycle', 'seg_consistency',
-                 'l1_decay', 'per_organ_weights']:
+                 'l1_decay', 'per_organ_weights', 'hu_profile']:
         v = getattr(args, f'use_{flag}', None)
         if v is not None:
             c[f'use_{flag}'] = v
@@ -216,7 +217,7 @@ def main():
     active = ['L1'] + [f for f in [
         'adversarial', 'perceptual', 'feature_matching',
         'ssim', 'gradient', 'frequency',
-        'organ', 'saliency', 'cycle', 'seg_consistency',
+        'organ', 'hu_profile', 'saliency', 'cycle', 'seg_consistency',
     ] if config.get(f'use_{f}')]
     log.info(f"Losses     : {' + '.join(active)}")
     log.info(f"Selection  : {config.get('selection_metric', 'val_org_ssim')}")

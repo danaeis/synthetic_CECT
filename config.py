@@ -98,14 +98,24 @@ SEED       = 42
 
 # ── Training schedule ────────────────────────────────────────────────────────
 BATCH_SIZE   = 16
-EPOCHS       = 80
+# Measured on the l1_only / bowel_zero / organ_curriculum runs: organ-region SSIM
+# plateaus by epoch ~13 and the remaining ~55 epochs change nothing (train L1 flat
+# at 0.0137 raw from epoch 13 to 69). 45 leaves margin for the decay curriculum to
+# finish at epoch 30 and anneal afterwards, without paying for dead epochs.
+EPOCHS       = 45
 LR_GEN       = 2e-4
 LR_DISC      = 1e-4
 BETAS        = (0.5, 0.999)
 WEIGHT_DECAY = 1e-5
 
+# Cosine annealing with WARM RESTARTS was measurably harmful: with T0=15/TMULT=2
+# the restarts land at epochs 15 and 46, and each one costs performance it then
+# spends ~15 epochs recovering (org-SSIM 0.93644 @ep13 → 0.93440 @ep17; a second
+# dip after the ep46 restart). Every best value occurred at the LOW-LR end of a
+# cycle, never after a restart — the restarts never found a better optimum.
+# Setting T0 >= EPOCHS gives a single monotone anneal, i.e. no restart.
 USE_COSINE    = True
-COSINE_T0     = 15
+COSINE_T0     = 45
 COSINE_TMULT  = 2
 COSINE_ETA    = 5e-7
 
@@ -115,6 +125,21 @@ NUM_WORKERS         = 0     # 0 = fastest when patches are fully in RAM
 # ── Architecture ─────────────────────────────────────────────────────────────
 GEN_BASE_CH  = 64
 GEN_DROPOUT  = 0.20
+
+# Generator normalisation: 'instance' | 'group' | 'batch'  (models._norm)
+#
+# This is a TILING decision, not a regularisation one. InstanceNorm rescales each
+# patch by its own spatial statistics, so the same voxel seen by two overlapping
+# tiles gets two different content-dependent affine transforms — the tiles then
+# disagree by a DC offset that overlap-blending cannot cancel, which shows up as a
+# visible patch border in the reconstructed volume (`metrics.seam_energy`).
+# 'batch' applies fixed running statistics at eval() and is the only option here
+# that is tile-invariant by construction; 'group' is the middle ground.
+#
+# Left at 'instance' so existing checkpoints keep loading — a run's own
+# run_config.json carries this forward to inference. Quantify before switching:
+#     python norm_attribution.py --scenario_dir <run>
+GEN_NORM     = 'instance'
 
 # ── Baseline loss flags (pix2pixHD combination) ───────────────────────────────
 USE_ADVERSARIAL      = False
@@ -126,6 +151,13 @@ USE_SSIM             = False
 USE_GRADIENT         = False
 USE_FREQUENCY        = False
 USE_ORGAN            = False
+# Per-organ MEAN-HU loss. The phase classifier reads per-organ median HU and
+# nothing else, so this optimises its input features directly rather than hoping
+# a per-voxel loss gets there indirectly. Needs multi-label masks (i.e.
+# ORGAN_WEIGHTS set) to be worth much. Never use it alone — a patch can score 0
+# on it while looking nothing like the target; it fixes an organ's LEVEL, while
+# the organ/L1 terms fix its texture.
+USE_HU_PROFILE       = False
 USE_SALIENCY         = False
 USE_CYCLE            = False
 USE_SEG_CONSISTENCY  = False
@@ -170,7 +202,21 @@ LAMBDA_FEATURE_MATCH =  10.0
 LAMBDA_SSIM          =  10.0
 LAMBDA_GRADIENT      =   5.0
 LAMBDA_FREQUENCY     =   1.0
-LAMBDA_ORGAN         =   5.0
+# Raised 5.0 → 20.0 on evidence: at λ=5 the organ term reached only 5% of the L1
+# term early and 21% after the decay completed — a minority of the gradient
+# throughout. The tiered weighting still produced a significant HU improvement at
+# that strength (feature L1 −1.58 HU, t=−4.22 vs l1_only), so give it enough
+# weight to actually compete. This is the main knob to sweep next.
+LAMBDA_ORGAN         =  20.0
+# HU-profile term, sized from the measured error rather than guessed. Its raw
+# value is a per-organ mean difference in normalised [0,1] units: the observed
+# residual is ~15 HU on the 600 HU window (-200..400), i.e. ~0.025 normalised.
+# At lambda=10 the term would contribute ~0.25 against an organ term of ~6.5 —
+# under 4% of the gradient, which is precisely the mistake that made
+# LAMBDA_ORGAN=5 ineffective (it peaked at 21% and moved almost nothing).
+# lambda=50 puts it at ~1.25, a fifth of the organ term: enough to matter,
+# not enough to dominate the spatial terms it is meant to complement.
+LAMBDA_HU_PROFILE    =  50.0
 ORGAN_WEIGHT         =  10.0   # legacy uniform mode, used only when ORGAN_WEIGHTS is None
 
 # ── Per-organ loss weights ───────────────────────────────────────────────────
@@ -427,6 +473,7 @@ train_config: dict = dict(
     # architecture
     generator_base_channels = GEN_BASE_CH,
     generator_dropout       = GEN_DROPOUT,
+    generator_norm          = GEN_NORM,
     # baseline loss flags
     use_adversarial      = USE_ADVERSARIAL,
     use_perceptual       = USE_PERCEPTUAL,
@@ -436,6 +483,7 @@ train_config: dict = dict(
     use_gradient         = USE_GRADIENT,
     use_frequency        = USE_FREQUENCY,
     use_organ            = USE_ORGAN,
+    use_hu_profile       = USE_HU_PROFILE,
     use_saliency         = USE_SALIENCY,
     use_cycle            = USE_CYCLE,
     use_seg_consistency  = USE_SEG_CONSISTENCY,
@@ -453,6 +501,7 @@ train_config: dict = dict(
     lambda_gradient      = LAMBDA_GRADIENT,
     lambda_frequency     = LAMBDA_FREQUENCY,
     lambda_organ         = LAMBDA_ORGAN,
+    lambda_hu_profile    = LAMBDA_HU_PROFILE,
     organ_weight         = ORGAN_WEIGHT,
     organ_weights            = ORGAN_WEIGHTS,          # None → legacy uniform mode
     organ_weight_preset      = ORGAN_WEIGHT_PRESET,

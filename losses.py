@@ -388,6 +388,78 @@ class OrganWeightedLoss(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# 7b. Organ HU-profile loss (dimension-agnostic)
+# ---------------------------------------------------------------------------
+
+class OrganHUProfileLoss(nn.Module):
+    """Penalise each organ's MEAN intensity deviation, not its per-voxel error.
+
+    Motivation, from the measured ablation: the XGBoost phase classifier reads
+    per-organ *median HU* — nothing else. Contrast phase is defined by the
+    absolute enhancement level of each organ, so that is what a phase-faithful
+    generator has to get right. Per-voxel losses optimise it only indirectly, and
+    the scenario that most improved per-organ HU error (organ_curriculum,
+    -1.58 HU vs baseline, t=-4.22) did so as a side effect rather than by
+    targeting it.
+
+    This complements OrganWeightedLoss rather than replacing it: that one
+    sharpens texture *within* an organ, this one fixes the organ's overall level.
+    A patch can score 0 here while looking nothing like the target, so it must
+    never be the only spatial term.
+
+    Weight-0 organs (bowel) are skipped entirely, as in OrganWeightedLoss —
+    their content is not inferable from NCCT, so their mean HU is not a
+    meaningful target either.
+    """
+
+    def __init__(
+        self,
+        organ_weights:  Optional[Dict[int, float]] = None,
+        default_weight: float = 1.0,
+        min_voxels:     int = 16,
+        max_label:      int = 256,
+    ):
+        super().__init__()
+        self.min_voxels = min_voxels
+        self.default_weight = float(default_weight)
+        lut = torch.full((max_label,), float(default_weight))
+        lut[0] = 0.0                      # background has no meaningful "level"
+        for lid, w in (organ_weights or {}).items():
+            lut[int(lid)] = float(w)
+        self.register_buffer('lut', lut)
+
+    def forward(
+        self,
+        pred:   torch.Tensor,
+        target: torch.Tensor,
+        mask:   Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if mask is None:
+            return pred.new_zeros(())
+
+        lbl = mask.round().long().clamp(0, self.lut.numel() - 1)
+        total = pred.new_zeros(())
+        wsum = pred.new_zeros(())
+        # Loop over the labels actually present — typically ~10-40 per patch, far
+        # fewer than the 117 possible, and each iteration is two masked means.
+        for lid in torch.unique(lbl):
+            if lid.item() == 0:
+                continue
+            w = self.lut[lid]
+            if w == 0:
+                continue
+            sel = (lbl == lid)
+            n = sel.sum()
+            if n < self.min_voxels:       # too few voxels for a stable mean
+                continue
+            mu_p = pred[sel].mean()
+            mu_t = target[sel].mean()
+            total = total + w * (mu_p - mu_t).abs()
+            wsum = wsum + w
+        return total / wsum.clamp_min(1e-8)
+
+
+# ---------------------------------------------------------------------------
 # 8.  Phase saliency loss (dimension-agnostic)
 # ---------------------------------------------------------------------------
 
@@ -560,10 +632,6 @@ class CompositeLoss(nn.Module):
         self.use_adv  = c.get('use_adversarial', True)
         self.use_perc = c.get('use_perceptual', True)
         self.use_fm   = c.get('use_feature_matching', True)
-        if self.use_adv or self.use_perc or self.use_fm:
-            self.lambda_l1 = c.get('lambda_l1_reduced', 25.0)
-        else:
-            self.lambda_l1 = c.get('lambda_l1', 100.0)
 
         # L1 decay curriculum: hold lambda_l1 until l1_decay_start_epoch, then
         # ramp linearly down to lambda_l1_floor by l1_decay_end_epoch and hold.
@@ -572,9 +640,30 @@ class CompositeLoss(nn.Module):
         self.l1_decay_start  = c.get('l1_decay_start_epoch', 10)
         self.l1_decay_end    = c.get('l1_decay_end_epoch', 30)
         self.lambda_l1_floor = c.get('lambda_l1_floor', 25.0)
-        if self.use_l1_decay and self.lambda_l1_floor > self.lambda_l1:
-            log.warning(f"lambda_l1_floor ({self.lambda_l1_floor}) > lambda_l1 "
-                        f"({self.lambda_l1}) — L1 will ramp UP, not decay.")
+
+        # Where the schedule STARTS. When the decay is on it starts from the full
+        # lambda_l1 and ignores lambda_l1_reduced: the decay IS the mechanism for
+        # backing L1 off, so applying the static reduction as well is
+        # double-counting. Applying both is what silently broke l1_adv_organ —
+        # adversarial pinned the start to 25, the floor was also 25, and the
+        # curriculum ran 25→25, i.e. did nothing for the entire run.
+        if self.use_l1_decay:
+            self.lambda_l1 = c.get('lambda_l1', 100.0)
+        elif self.use_adv or self.use_perc or self.use_fm:
+            self.lambda_l1 = c.get('lambda_l1_reduced', 25.0)
+        else:
+            self.lambda_l1 = c.get('lambda_l1', 100.0)
+
+        if self.use_l1_decay:
+            if self.lambda_l1_floor > self.lambda_l1:
+                log.warning(f"lambda_l1_floor ({self.lambda_l1_floor}) > lambda_l1 "
+                            f"({self.lambda_l1}) — L1 will ramp UP, not decay.")
+            elif self.lambda_l1_floor == self.lambda_l1:
+                log.warning(
+                    f"use_l1_decay is ON but lambda_l1 == lambda_l1_floor "
+                    f"({self.lambda_l1}) — the curriculum is a NO-OP and L1 will "
+                    f"stay constant for the whole run. Lower lambda_l1_floor or "
+                    f"raise lambda_l1.")
 
         self.lambda_adv = c.get('lambda_adv', 1.0)
         self.adv_warmup = c.get('adv_warmup_epochs', 5)
@@ -622,6 +711,18 @@ class CompositeLoss(nn.Module):
                 default_weight    = c.get('organ_weight_default', 1.0),
                 background_weight = c.get('organ_weight_background', 1.0),
             )
+
+        self.use_hu_profile  = c.get('use_hu_profile', False)
+        self.lambda_hu_profile = c.get('lambda_hu_profile', 10.0)
+        if self.use_hu_profile:
+            self.hu_profile = OrganHUProfileLoss(
+                organ_weights  = c.get('organ_weights'),
+                default_weight = c.get('organ_weight_default', 1.0),
+            )
+            if not c.get('organ_weights'):
+                log.warning("use_hu_profile is on but organ_weights is None — every "
+                            "organ gets the default weight. The term still works, but "
+                            "the phase-critical vessels get no priority.")
 
         self.use_sal    = c.get('use_saliency', False)
         self.lambda_sal = c.get('lambda_saliency', 5.0)
@@ -739,6 +840,12 @@ class CompositeLoss(nn.Module):
             d['organ'] = org.item();  total = total + org
         else:
             d['organ'] = 0.0
+
+        if self.use_hu_profile:
+            hup = self.hu_profile(pred, target, mask) * self.lambda_hu_profile
+            d['hu_profile'] = hup.item();  total = total + hup
+        else:
+            d['hu_profile'] = 0.0
 
         if self.use_sal and source is not None:
             sal = self.saliency(pred, target, source) * self.lambda_sal

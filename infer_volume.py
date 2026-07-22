@@ -12,7 +12,7 @@ or organ-crop shortcuts:
   • tile the NCCT volume into patches (patch_size / overlap / patch_depth from the
     run's own run_config.json),
   • normalise each patch exactly as dataset.py does (clip [hu_min,hu_max] → [0,1]),
-  • run G (batched), stitch back with uniform overlap-averaging,
+  • run G (batched), stitch back with weighted overlap-blending (--blend),
   • de-normalise [0,1] → HU, save as NIfTI on the source grid.
 
 Dims-parametric: `patch_depth==1` → 2-D per-slice; `patch_depth>1` → 3-D sub-volume.
@@ -34,7 +34,7 @@ import csv
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import nibabel as nib
 import numpy as np
@@ -56,6 +56,7 @@ def load_generator(ckpt_path: str, cfg: Dict, device: str) -> UNetGenerator:
         dims          = cfg.get('dims', 2),
         base_channels = cfg['generator_base_channels'],
         dropout       = cfg.get('generator_dropout', 0.2),
+        norm          = cfg.get('generator_norm', 'instance'),
     ).to(device)
     # weights_only=False: checkpoints also carry non-tensor state (history,
     # early_stop, ...); we only read G_state but must be able to unpickle them.
@@ -81,20 +82,66 @@ def _starts(length: int, patch: int, stride: int) -> List[int]:
     return s
 
 
+def _axis_window(n: int, mode: str, margin: int,
+                 at_lo: bool, at_hi: bool) -> np.ndarray:
+    """1-D blend weight along one tile axis.
+
+    `margin` discards the outer band of the tile, where every output voxel was
+    computed partly from the zero-padding the convolutions invented outside the
+    tile (padding=1 nested 9 deep in UNetGenerator ⇒ a systematically corrupted
+    band ~20-30 px wide). The margin is NOT applied on a side that lies on the
+    volume boundary — there is no neighbouring tile to supply those voxels, so
+    trimming them would leave the volume's own outer shell uncovered.
+    """
+    if mode == 'uniform':
+        w = np.ones(n, np.float32)
+    elif mode == 'hann':
+        # n+2 then trim: a plain Hann is exactly 0 at both ends, which would make
+        # the outermost row of every tile weightless and, on a border tile,
+        # unrecoverable.
+        w = np.hanning(n + 2)[1:-1].astype(np.float32)
+    elif mode == 'gaussian':
+        x = (np.arange(n, dtype=np.float32) - (n - 1) / 2) / max(1.0, (n - 1) / 2)
+        w = np.exp(-0.5 * (x / 0.35) ** 2).astype(np.float32)
+    else:
+        raise ValueError(f'unknown blend mode: {mode}')
+
+    if margin > 0 and n > 2 * margin:
+        if not at_lo:
+            w[:margin] = 0.0
+        if not at_hi:
+            w[-margin:] = 0.0
+    return w
+
+
 @torch.no_grad()
 def infer_volume(G: UNetGenerator, vol_dhw: np.ndarray, cfg: Dict, device: str,
-                 batch_size: int = 32) -> np.ndarray:
+                 batch_size: int = 32, blend: str = 'hann',
+                 edge_margin: int = 0, overlap: Optional[float] = None) -> np.ndarray:
     """Reconstruct a full synthetic CECT volume (HU, (D,H,W)) from an NCCT volume.
 
-    Uniform overlap-averaging. Patches are normalised/denormalised with the run's
+    Weighted overlap-blending. Patches are normalised/denormalised with the run's
     own HU window so the generator sees exactly the training input distribution.
+
+    `blend='uniform'` reproduces the original flat average, whose blend weight
+    jumps discontinuously wherever a tile starts — measured at seam=1.27 against
+    a seam=1.04 floor from a real untouched scan (`metrics.seam_energy`). A
+    tapered window removes that discontinuity.
+
+    NOTE this cannot fix a seam caused by the generator itself: InstanceNorm
+    rescales each tile by that tile's own statistics, so overlapping tiles
+    disagree by a content-dependent DC offset that no blending weight can
+    reconcile. Blending is necessary, not sufficient; see the norm ablation.
+
+    `overlap` overrides the training-time value from the config — inference
+    overlap is free to be higher than what training used.
     """
-    dims = cfg.get('dims', 2)
     pd = int(cfg.get('patch_depth', 1))
     ps = cfg['patch_size']
     ph, pw = (int(ps), int(ps)) if isinstance(ps, int) else (int(ps[0]), int(ps[1]))
     hu_min = float(cfg.get('hu_min', -200)); hu_max = float(cfg.get('hu_max', 400))
-    ratio = 1.0 - cfg.get('overlap', 0.5)
+    ov = cfg.get('overlap', 0.5) if overlap is None else float(overlap)
+    ratio = 1.0 - ov
     sh = max(1, int(ph * ratio)); sw = max(1, int(pw * ratio))
     sd = max(1, int(pd * ratio)) if pd > 1 else 1
     use_amp = (device == 'cuda')
@@ -118,6 +165,23 @@ def infer_volume(G: UNetGenerator, vol_dhw: np.ndarray, cfg: Dict, device: str,
     h_starts = _starts(Hp, ph, sh)
     w_starts = _starts(Wp, pw, sw)
 
+    # Blend windows depend only on which volume edges a tile touches, so there are
+    # at most a handful of distinct ones — build each once and reuse.
+    _wcache: Dict = {}
+
+    def _window(d0, y0, x0):
+        key = (d0 == 0, d0 + pd >= Dp, y0 == 0, y0 + ph >= Hp, x0 == 0, x0 + pw >= Wp)
+        if key not in _wcache:
+            wh = _axis_window(ph, blend, edge_margin, key[2], key[3])
+            ww = _axis_window(pw, blend, edge_margin, key[4], key[5])
+            if pd > 1:
+                wd = _axis_window(pd, blend, edge_margin, key[0], key[1])
+                w = wd[:, None, None] * wh[None, :, None] * ww[None, None, :]
+            else:
+                w = wh[:, None] * ww[None, :]
+            _wcache[key] = w.astype(np.float32)
+        return _wcache[key]
+
     buf_patch, buf_coord = [], []
 
     def _flush():
@@ -128,12 +192,13 @@ def infer_volume(G: UNetGenerator, vol_dhw: np.ndarray, cfg: Dict, device: str,
             out = G(batch)
         out = out.squeeze(1).float().cpu().numpy()   # (B, ...) in [0,1]
         for (d0, y0, x0), o in zip(buf_coord, out):
+            w = _window(d0, y0, x0)
             if pd > 1:
-                out_sum[d0:d0+pd, y0:y0+ph, x0:x0+pw] += o
-                out_cnt[d0:d0+pd, y0:y0+ph, x0:x0+pw] += 1.0
+                out_sum[d0:d0+pd, y0:y0+ph, x0:x0+pw] += o * w
+                out_cnt[d0:d0+pd, y0:y0+ph, x0:x0+pw] += w
             else:
-                out_sum[d0, y0:y0+ph, x0:x0+pw] += o
-                out_cnt[d0, y0:y0+ph, x0:x0+pw] += 1.0
+                out_sum[d0, y0:y0+ph, x0:x0+pw] += o * w
+                out_cnt[d0, y0:y0+ph, x0:x0+pw] += w
         buf_patch.clear(); buf_coord.clear()
 
     for d0 in d_starts:
@@ -148,7 +213,15 @@ def infer_volume(G: UNetGenerator, vol_dhw: np.ndarray, cfg: Dict, device: str,
                     _flush()
     _flush()
 
-    out_cnt[out_cnt == 0] = 1.0                       # guard (shouldn't happen)
+    # With edge-aware margins every voxel keeps positive weight, so a zero here
+    # means a real coverage bug rather than a benign edge case — say so instead of
+    # silently emitting hu_min.
+    n_zero = int((out_cnt <= 0).sum())
+    if n_zero:
+        log.error(f"  {n_zero} voxel(s) received no tile weight "
+                  f"(blend={blend}, edge_margin={edge_margin}) — output invalid there; "
+                  f"reduce --edge_margin or raise --overlap")
+        out_cnt[out_cnt <= 0] = 1.0
     syn01 = out_sum / out_cnt
     syn_hu = syn01 * (hu_max - hu_min) + hu_min
     return syn_hu[:D, :H, :W]                          # crop away any padding
@@ -159,7 +232,8 @@ def infer_volume(G: UNetGenerator, vol_dhw: np.ndarray, cfg: Dict, device: str,
 # ---------------------------------------------------------------------------
 
 def run(scenario_dir: str, split: str, out_dir: str, ckpt_name: str,
-        batch_size: int, device: str):
+        batch_size: int, device: str, blend: str = 'hann',
+        edge_margin: int = 0, overlap: Optional[float] = None):
     sdir = Path(scenario_dir)
     cfg = json.loads((sdir / 'run_config.json').read_text())
     ckpt = sdir / ckpt_name
@@ -186,7 +260,8 @@ def run(scenario_dir: str, split: str, out_dir: str, ckpt_name: str,
             continue
         src_nii = nib.load(pair['source_path'])
         src_dhw = _load_vol(pair['source_path'])
-        syn_hu_dhw = infer_volume(G, src_dhw, cfg, device, batch_size=batch_size)
+        syn_hu_dhw = infer_volume(G, src_dhw, cfg, device, batch_size=batch_size,
+                                  blend=blend, edge_margin=edge_margin, overlap=overlap)
         # back to native (X,Y,Z) orientation to match real/mask that phase_eval
         # loads raw; save on the source grid/affine.
         syn_xyz = np.transpose(syn_hu_dhw, (2, 1, 0)).astype(np.float32)
@@ -214,11 +289,23 @@ def main():
     ap.add_argument('--out_dir', default=None, help='default: <scenario_dir>/phase_infer')
     ap.add_argument('--ckpt_name', default='best_model.pth')
     ap.add_argument('--batch_size', type=int, default=32)
+    ap.add_argument('--blend', default='hann', choices=['uniform', 'hann', 'gaussian'],
+                    help="tile blend window. 'uniform' is the original flat average "
+                         "(measured seam=1.27 vs a 1.04 floor); default 'hann' tapers "
+                         "the weight so it is continuous across a tile boundary.")
+    ap.add_argument('--edge_margin', type=int, default=0,
+                    help='discard this many voxels from each tile side before '
+                         'blending (the conv zero-padding band). Not applied on '
+                         'sides lying on the volume boundary. Needs enough overlap '
+                         'to stay covered: margin < patch_size*overlap/2.')
+    ap.add_argument('--overlap', type=float, default=None,
+                    help='override the training-time overlap for inference only')
     args = ap.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     out_dir = args.out_dir or str(Path(args.scenario_dir) / 'phase_infer')
-    run(args.scenario_dir, args.split, out_dir, args.ckpt_name, args.batch_size, device)
+    run(args.scenario_dir, args.split, out_dir, args.ckpt_name, args.batch_size, device,
+        blend=args.blend, edge_margin=args.edge_margin, overlap=args.overlap)
 
 
 if __name__ == '__main__':
