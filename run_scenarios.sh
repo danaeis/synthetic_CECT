@@ -51,23 +51,24 @@ SCENARIOS=(
   # add more scenarios here, format: "name|--flag1 --flag2 ..."
 )
 
+SEEDS="${SEEDS:-42}"
+
 run_one() {
   local name="$1" flags="$2"
-  local out="${BASE_OUT}_${name}"
-  mkdir -p "$out"
-  echo "=== [$(date '+%F %T')] Scenario: $name  ->  $out ==="
-  # shellcheck disable=SC2086
-  python train.py --output_dir "$out" $flags 2>&1 | tee -a "$out/run_scenarios.log"
-  local status="${PIPESTATUS[0]}"
-  if [[ "$status" -ne 0 ]]; then
-    echo "!!! Scenario '$name' FAILED (exit $status)"
-    if [[ "$STOP_ON_ERROR" -eq 1 ]]; then
-      echo "Stopping (STOP_ON_ERROR=1). Remaining scenarios not run."
-      exit "$status"
+  for seed in $SEEDS; do
+    local out="${BASE_OUT}_${name}"
+    [[ "$seed" != "42" || "$SEEDS" != "42" ]] && out="${out}_s${seed}"
+    mkdir -p "$out"
+    echo "=== [$(date '+%F %T')] Scenario: $name  seed=$seed  ->  $out ==="
+    # shellcheck disable=SC2086
+    python train.py --output_dir "$out" --seed "$seed" $flags \
+      2>&1 | tee -a "$out/run_scenarios.log"
+    local status="${PIPESTATUS[0]}"
+    if [[ "$status" -ne 0 ]]; then
+      echo "!!! Scenario '$name' seed $seed FAILED (exit $status)"
+      [[ "$STOP_ON_ERROR" -eq 1 ]] && exit "$status"
     fi
-  else
-    echo "=== Scenario '$name' done ==="
-  fi
+  done
 }
 
 if [[ $# -gt 0 ]]; then

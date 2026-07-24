@@ -112,6 +112,12 @@ def score_model(name: str, manifest: Path, ev: PhaseEvaluator,
         r01 = M.to_unit(real, hu_min, hu_max)
         vm = M.volume_metrics(g01, r01)
         om = M.masked_metrics(g01, r01, mask)
+        # Body-region: same pixel metrics, but excluding voxels the HU window
+        # saturates to 0/1 in both volumes. Built from `real` so it is identical
+        # across models.
+        bmask = M.body_mask(real)
+        bm = M.masked_metrics(g01, r01, bmask)
+
         # Texture + reconstruction consistency. Neither is expressible in the
         # metrics above: PSNR/SSIM/per-organ HU all reward blur, and nothing
         # scores tile seams or through-plane flicker at all.
@@ -134,6 +140,8 @@ def score_model(name: str, manifest: Path, ev: PhaseEvaluator,
             'case': Path(c['real_path']).name,
             **{f'{k}': vm[k] for k in ('psnr', 'ssim', 'mae', 'mse', 'pcc')},
             **{f'org_{k}': om[k] for k in ('psnr', 'ssim', 'mae', 'mse', 'pcc')},
+            **{f'body_{k}': bm[k] for k in ('psnr', 'ssim', 'mae', 'mse', 'pcc')},
+            'body_frac': float(bmask.mean()),
             **tx,          # raps_hf, grad_w1, org_grad_w1
             **cs,          # seam, zflicker
             'phase_match': int(ph['gen_matches_target']),
@@ -158,6 +166,7 @@ def _nanstd(xs):
 def summarise(name: str, rows: List[Dict]) -> Dict:
     pixel = ['psnr', 'ssim', 'mae', 'mse', 'pcc',
              'org_psnr', 'org_ssim', 'org_mae', 'org_mse', 'org_pcc',
+             'body_psnr', 'body_ssim', 'body_mae', 'body_frac',
              'raps_hf', 'grad_w1', 'org_grad_w1', 'seam', 'zflicker', 'zaniso']
     out = {'model': name, 'n': len(rows)}
     for k in pixel:
@@ -204,6 +213,7 @@ PAIRED_METRICS = [
     ('org_mae',       True,  None,  'org_mae'),
     ('org_ssim',      False, None,  'org_ssim'),
     ('psnr',          False, None,  'psnr'),
+    ('body_mae',      True,  None,  'body_mae'),
     # Texture: the axis the four above cannot see.
     ('raps_hf',       True,  _dev1, '|raps_hf-1|'),
     ('grad_w1',       True,  None,  'grad_w1'),
@@ -254,6 +264,8 @@ def master_table(summaries: List[Dict], out: List[str]):
             ('mae', 'MAE', '{:.4f}'), ('mse', 'MSE', '{:.5f}'), ('pcc', 'PCC', '{:.4f}'),
             ('org_psnr', 'oPSNR', '{:.2f}'), ('org_ssim', 'oSSIM', '{:.4f}'),
             ('org_mae', 'oMAE', '{:.4f}'),
+            ('body_psnr', 'bPSNR', '{:.2f}'), ('body_mae', 'bMAE', '{:.4f}'),
+            ('body_frac', 'body%', '{:.2f}'),
             ('phase_acc', 'phase', '{:.2f}'), ('gen_prob', 'prob', '{:.4f}'),
             ('feature_l1_hu', 'featHU', '{:.2f}'),
             ('raps_hf', 'RAPS', '{:.3f}'), ('grad_w1', 'gradW1', '{:.4f}'),

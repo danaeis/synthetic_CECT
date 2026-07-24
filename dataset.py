@@ -23,6 +23,7 @@ import functools
 import hashlib
 import json
 import logging
+from random import random
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -92,7 +93,7 @@ def find_pairs_and_split(
                                                         # regenerated full TS masks
     val_split    = cfg.get('val_split',  0.15)
     test_split   = cfg.get('test_split', 0.15)
-    seed         = cfg.get('seed', 42)
+    seed         = cfg.get('data_seed', cfg.get('seed', 42))
 
     # Optional labels CSV
     phase_map: Dict[str, Dict[str, str]] = {}
@@ -270,7 +271,7 @@ class CTPairDataset(Dataset):
                                     or self.organ_focus_labels is not None
                                     or cfg.get('organ_weights'))
 
-        rng = np.random.default_rng(cfg.get('seed', 42))
+        rng = np.random.default_rng(cfg.get('data_seed', cfg.get('seed', 42)))
         self._rng = rng
 
         # ── Cache: skip indexing + preload entirely if a prior run already
@@ -568,7 +569,7 @@ class CTPairDataset(Dataset):
             'hu_min':       self.hu_min,
             'hu_max':       self.hu_max,
             'max_patches':  max_patches,
-            'seed':         cfg.get('seed', 42),
+            'seed':         cfg.get('data_seed', cfg.get('seed', 42)),
             'load_mask':    self.load_mask,
             # Binary vs raw-label mask changes cached content. This also covers
             # turning per-organ loss weights on/off (they flip mask_multilabel).
@@ -686,6 +687,14 @@ def build_loaders(cfg: Dict) -> Tuple[DataLoader, DataLoader]:
     # on CPU it does nothing but emit a warning, so gate it on the actual device.
     pin = str(cfg.get('device', 'cpu')).startswith('cuda')
 
+    g = torch.Generator()
+    g.manual_seed(int(cfg.get('seed', 42)))
+
+    def _worker_init(worker_id):
+        s = int(cfg.get('seed', 42)) + worker_id
+        np.random.seed(s % (2 ** 32))
+        random.seed(s)
+
     train_loader = DataLoader(
         train_ds,
         batch_size  = cfg['batch_size'],
@@ -693,7 +702,9 @@ def build_loaders(cfg: Dict) -> Tuple[DataLoader, DataLoader]:
         num_workers = num_workers,
         pin_memory  = pin,
         drop_last   = True,
-    )
+        generator   = g,
+        worker_init_fn = _worker_init if num_workers > 0 else None,
+     )
     val_loader = DataLoader(
         val_ds,
         batch_size  = cfg['batch_size'],

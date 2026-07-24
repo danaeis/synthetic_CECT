@@ -94,7 +94,7 @@ MAX_VAL_PATCHES   =  4_000
 # ── Train/val/test split ─────────────────────────────────────────────────────
 VAL_SPLIT  = 0.15
 TEST_SPLIT = 0.15
-SEED       = 42
+DATA_SEED  = 42
 
 # ── Training schedule ────────────────────────────────────────────────────────
 BATCH_SIZE   = 16
@@ -456,7 +456,7 @@ train_config: dict = dict(
     # split
     val_split            = VAL_SPLIT,
     test_split           = TEST_SPLIT,
-    seed                 = SEED,
+    data_seed            = DATA_SEED,
     # training
     batch_size           = BATCH_SIZE,
     epochs               = EPOCHS,

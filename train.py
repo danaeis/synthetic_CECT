@@ -29,6 +29,9 @@ from pathlib import Path
 
 import torch
 
+import random
+import numpy as np
+
 from config import train_config, resolve_organ_weights
 from dataset import build_loaders
 from trainer import Trainer
@@ -39,6 +42,22 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+def set_seed(s: int, deterministic: bool = True):
+    """Seed every RNG that touches training.
+
+    Note what is NOT seeded elsewhere: dataset.py seeds only numpy, via
+    `data_seed`, and that covers the split and patch selection. Weight init,
+    dropout and DataLoader shuffle all draw from torch's global RNG, which was
+    previously unseeded — so no two runs of the same scenario were comparable.
+    """
+    random.seed(s)
+    np.random.seed(s)
+    torch.manual_seed(s)
+    torch.cuda.manual_seed_all(s)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    log.info(f"Seed       : {s} (deterministic={deterministic})")
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -55,6 +74,14 @@ def _parse():
                    help='ignore any existing checkpoint and start training from scratch')
     p.add_argument('--device',      type=str,   default=None,
                    help="override device, e.g. 'cuda', 'cuda:0', 'cpu'")
+    
+    p.add_argument('--seed', type=int, default=None,
+                   help='weight init / dropout / batch order. Vary this for seed replicates.')
+    p.add_argument('--data_seed', type=int, default=None,
+                   help='split + patch selection + cache key. Do NOT vary.')
+    p.add_argument('--nondeterministic', action='store_true',
+                   help='allow cudnn.benchmark (faster, not bit-reproducible)')
+
     p.add_argument('--epochs',      type=int,   default=None)
     p.add_argument('--batch_size',  type=int,   default=None)
     p.add_argument('--lr',          type=float, default=None)
@@ -112,7 +139,7 @@ def _apply(cfg: dict, args) -> dict:
     for k in ['selection_metric', 'sample_mode', 'sample_n',
               'lambda_organ', 'lambda_hu_profile', 'lambda_l1_floor',
               'l1_decay_start_epoch', 'l1_decay_end_epoch',
-              'adv_warmup_epochs', 'lr_disc']:
+              'adv_warmup_epochs', 'lr_disc', 'seed', 'data_seed']:
         v = getattr(args, k, None)
         if v is not None:
             c[k] = v
@@ -221,6 +248,13 @@ def main():
     ] if config.get(f'use_{f}')]
     log.info(f"Losses     : {' + '.join(active)}")
     log.info(f"Selection  : {config.get('selection_metric', 'val_org_ssim')}")
+
+    set_seed(int(config.get('seed', 42)),
+             deterministic=not args.nondeterministic)
+    if config.get('data_seed', 42) != 42:
+        log.warning("data_seed != 42 — the train/val/test split has CHANGED. "
+                    "Benchmarks against runs with data_seed=42 are invalid.")
+
     if config.get('use_l1_decay'):
         log.info(f"L1 decay   : {config['lambda_l1']} → {config['lambda_l1_floor']} "
                  f"over epochs {config['l1_decay_start_epoch']}–{config['l1_decay_end_epoch']}")

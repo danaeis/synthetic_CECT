@@ -57,10 +57,11 @@ as a distance from 1.0, never as "higher is better". The same applies to `seam`,
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
-from scipy.ndimage import gaussian_filter
+
+from scipy.ndimage import gaussian_filter, binary_closing, binary_fill_holes, label
 
 __all__ = ['to_unit', 'mae', 'mse', 'psnr', 'pcc', 'ssim',
-           'volume_metrics', 'masked_metrics',
+           'volume_metrics', 'masked_metrics', 'body_mask',
            'raps', 'raps_hf_ratio', 'grad_hist_distance', 'tile_starts',
            'seam_energy', 'z_flicker', 'z_flicker_anisotropy',
            'texture_metrics', 'consistency_metrics']
@@ -497,3 +498,38 @@ def masked_metrics(gen: np.ndarray, real: np.ndarray, mask: np.ndarray,
         'mse':  mse(p, t),
         'pcc':  float(s12 / (s1 * s2)) if s1 * s2 > 0 else float('nan'),
     }
+
+def body_mask(vol_hu: np.ndarray, hu_thr: float = -500.0,
+              slice_axis: int = -1, close_iter: int = 2) -> np.ndarray:
+    """Patient-interior mask from a HU volume: excludes scanner air, the table,
+    and everything outside the body contour.
+
+    Why this exists: `to_unit` clips to [hu_min, hu_max], so every voxel below
+    hu_min (air, lung, much of the fat) maps to exactly 0.0 and every voxel above
+    hu_max (cortical bone) to exactly 1.0 — identically in the prediction and the
+    target. Those voxels contribute zero error for EVERY model, and the global
+    PSNR/SSIM/MAE/MSE/PCC average over them. On abdominal CT that is a large
+    fraction of the volume, which is why the global metrics separate models far
+    less than the organ-region ones (measured: global MAE 5.9 HU vs organ 19 HU).
+
+    Computed per slice: a 3-D component leaks through the table where it touches
+    the patient, and a 3-D hole-fill is much slower for no gain.
+
+    Always build this from the REAL volume, never the generated one, so the mask
+    is identical across models being compared.
+    """
+    v = np.moveaxis(np.asarray(vol_hu), slice_axis, 0)
+    out = np.zeros(v.shape, dtype=bool)
+    for i, sl in enumerate(v):
+        m = sl > hu_thr
+        if not m.any():
+            continue
+        if close_iter:
+            m = binary_closing(m, iterations=close_iter)
+        lab, n = label(m)
+        if n > 1:                       # drop the table and any stray components
+            cnt = np.bincount(lab.ravel())
+            cnt[0] = 0
+            m = lab == int(cnt.argmax())
+        out[i] = binary_fill_holes(m)
+    return np.moveaxis(out, 0, slice_axis)
