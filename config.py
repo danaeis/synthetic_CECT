@@ -421,7 +421,7 @@ EARLY_STOP_PATIENCE  = 30  # was 12: too tight for adversarial/perceptual runs �
                            # tight patience cuts the run right as the trade-off
                            # starts to develop, before it can show up visually.
 
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
 # ── Assembled dict ────────────────────────────────────────────────────────────
 train_config: dict = dict(
