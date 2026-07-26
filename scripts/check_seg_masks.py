@@ -22,14 +22,18 @@ This script re-uses `find_pairs_and_split` (the exact same pairing logic
     loss nearly a no-op even though nothing looks broken in the logs.
 
 Usage (run on the machine that has the real data, e.g. the remote box):
-    python check_seg_masks.py
-    python check_seg_masks.py --data_dir /path/to/other/data_dir
+    python scripts/check_seg_masks.py
+    python scripts/check_seg_masks.py --data_dir /path/to/other/data_dir
 """
 
 import argparse
 import logging
 
 import numpy as np
+
+# Repo modules live one level up (this file sits in scripts/ or tests/).
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from config import train_config
 from dataset import _load_vol, find_pairs_and_split

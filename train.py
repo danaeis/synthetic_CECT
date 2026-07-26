@@ -91,6 +91,33 @@ def _parse():
                    help='1=2D (default), >1=3D (must also set --dims 3)')
     p.add_argument('--dims',        type=int,   default=None, choices=[2, 3])
 
+    # ── Capacity probes (Gate B of the roadmap) ──────────────────────────────
+    # These exist to answer "can this model fit its own training data at all?",
+    # which the 45-epoch runs leave open: raw train L1 flattens at ~0.0139 (≈8.3
+    # HU) against a val MAE of 0.0148 — a 6% gap, so there is no overfitting and
+    # the ceiling is capacity, optimisation, or the data itself.
+    p.add_argument('--base_ch', type=int, default=None,
+                   help='generator base channels (config GEN_BASE_CH=64). 32≈3.3M, '
+                        '64≈13.3M, 96≈30.0M params. 96 is the parameter-matched '
+                        'control for any attention claim.')
+    p.add_argument('--dropout', type=float, default=None,
+                   help='generator dropout (config GEN_DROPOUT=0.2). Set 0.0 for the '
+                        'deliberate-overfit probe.')
+    p.add_argument('--generator_norm', type=str, default=None,
+                   choices=['instance', 'group', 'batch'],
+                   help="generator norm (config GEN_NORM='instance'). A TILING "
+                        'decision: instance/group statistics span the patch, so a '
+                        "tile's own content shifts every output voxel — the seam "
+                        'cause (config.py:130-141, scripts/norm_attribution.py, '
+                        'scripts/erf.py).')
+    p.add_argument('--max_train_cases', type=int, default=None,
+                   help='cap TRAIN cases (val/test untouched, so the split stays '
+                        'comparable). Use with --dropout 0 and L1 only: if train MAE '
+                        'does not reach <2 HU on ~5 cases, capacity/optimisation is '
+                        'the bottleneck, not data.')
+    p.add_argument('--no_early_stop', action='store_true',
+                   help='disable early stopping (probe runs must reach the plateau)')
+
     p.add_argument('--perceptual_backbone', type=str, default=None, choices=['vgg', 'dino'])
     p.add_argument('--saliency_mode',       type=str, default=None, choices=['heuristic', 'dino'])
 
@@ -134,9 +161,15 @@ def _apply(cfg: dict, args) -> dict:
     if args.patch_size  is not None: c['patch_size']   = args.patch_size
     if args.patch_depth is not None: c['patch_depth']  = args.patch_depth
     if args.dims        is not None: c['dims']         = args.dims
+    if args.base_ch     is not None: c['generator_base_channels'] = args.base_ch
+    if args.dropout     is not None: c['generator_dropout']       = args.dropout
+    if args.generator_norm is not None: c['generator_norm']       = args.generator_norm
+    # A huge patience is used rather than a separate flag so the trainer's
+    # early-stop bookkeeping (and its history channel) stays on one code path.
+    if args.no_early_stop:           c['early_stop_patience']     = 10 ** 9
     if args.perceptual_backbone is not None: c['perceptual_backbone'] = args.perceptual_backbone
     if args.saliency_mode       is not None: c['saliency_mode']       = args.saliency_mode
-    for k in ['selection_metric', 'sample_mode', 'sample_n',
+    for k in ['selection_metric', 'sample_mode', 'sample_n', 'max_train_cases',
               'lambda_organ', 'lambda_hu_profile', 'lambda_l1_floor',
               'l1_decay_start_epoch', 'l1_decay_end_epoch',
               'adv_warmup_epochs', 'lr_disc', 'seed', 'data_seed']:

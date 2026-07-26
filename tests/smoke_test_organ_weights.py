@@ -22,6 +22,10 @@ import numpy as np
 import nibabel as nib
 import torch
 
+# Repo modules live one level up (this file sits in scripts/ or tests/).
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
 from config import resolve_organ_weights
 from dataset import CTPairDataset
 from losses import CompositeLoss, OrganWeightedLoss

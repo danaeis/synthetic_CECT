@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Dump the canonical case-level train/val/test split to benchmark/split.json.
+Dump the canonical case-level train/val/test split to splits/split.json.
 
 This is THE shared split for the benchmark: every external model's data adapter
 reads it so all models train and test on identical cases (seed 42). Run once, on
@@ -10,13 +10,17 @@ Reuses `find_pairs_and_split` (dataset.py) with the project's own config so the
 split is bit-for-bit the same one our own runs used.
 
 Usage:
-    python dump_split.py                       # uses config.train_config
-    python dump_split.py --seg_suffix _seg_full --out benchmark/split.json
+    python scripts/dump_split.py                       # uses config.train_config
+    python scripts/dump_split.py --seg_suffix _seg_full --out splits/split.json
 """
 
 import argparse
 import json
 from pathlib import Path
+
+# Repo modules live one level up (this file sits in scripts/ or tests/).
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from config import train_config
 from dataset import find_pairs_and_split
@@ -24,7 +28,7 @@ from dataset import find_pairs_and_split
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--out', type=Path, default=Path('benchmark/split.json'))
+    ap.add_argument('--out', type=Path, default=Path('splits/split.json'))
     ap.add_argument('--seg_suffix', default=None, help='override cfg seg_suffix')
     args = ap.parse_args()
 

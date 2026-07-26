@@ -17,9 +17,9 @@ based window instead of a guessed one.
 
 Usage:
     cd train/literature_baseline
-    python analyze_hu_range.py                      # uses config.py paths
-    python analyze_hu_range.py --n_cases 40          # subsample for speed
-    python analyze_hu_range.py --low_pct 1 --high_pct 99
+    python scripts/analyze_hu_range.py                      # uses config.py paths
+    python scripts/analyze_hu_range.py --n_cases 40          # subsample for speed
+    python scripts/analyze_hu_range.py --low_pct 1 --high_pct 99
 """
 
 import argparse
@@ -30,6 +30,10 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
+
+# Repo modules live one level up (this file sits in scripts/ or tests/).
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from config import train_config
 from dataset import _load_vol, find_pairs_and_split

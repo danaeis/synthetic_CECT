@@ -10,7 +10,7 @@ Two parts, no GPU / real data / trained weights needed:
      and a manifest whose gen/real/mask volumes are all the SAME shape (the exact
      requirement phase_eval.py enforces).
 
-Usage:  python smoke_test_infer.py
+Usage:  python tests/smoke_test_infer.py
 """
 
 import csv
@@ -22,6 +22,10 @@ from pathlib import Path
 import nibabel as nib
 import numpy as np
 import torch
+
+# Repo modules live one level up (this file sits in scripts/ or tests/).
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from models import UNetGenerator
 from infer_volume import infer_volume, load_generator, run

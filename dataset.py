@@ -303,7 +303,7 @@ class CTPairDataset(Dataset):
             # accepted for callers (smoke tests) that pass it. Without the
             # fallback this silently wrote every scenario's grid into the cwd,
             # where each run overwrote the last.
-            self._save_patch_grid(cfg.get('out_dir') or cfg.get('output_dir', Path('.')),
+            self._save_patch_grid(cfg.get('out_dir') or cfg.get('output_dir'),
                                   split_name)
             return
 
@@ -459,7 +459,7 @@ class CTPairDataset(Dataset):
                         log.warning(f"  Failed to load mask {seg_path}: {e}")
                 self.mask_patches.append(mp)
 
-        self._save_patch_grid(cfg.get('out_dir') or cfg.get('output_dir', Path('.')),
+        self._save_patch_grid(cfg.get('out_dir') or cfg.get('output_dir'),
                               split_name)
         log.info(f"  [{split_name}] {len(self.src_patches)} patch pairs in RAM"
                  + (f"  (+ organ masks)" if self.load_mask else ""))
@@ -604,8 +604,16 @@ class CTPairDataset(Dataset):
 
     # -----------------------------------------------------------------------
     def _save_patch_grid(self, out_dir, split_name: str, n: int = 16):
-        """Save a grid of (source | target) slice pairs for visual inspection."""
+        """Save a grid of (source | target) slice pairs for visual inspection.
+
+        `out_dir=None` skips writing. Previously this defaulted to Path('.'),
+        which dropped patch_grids/ into whatever the cwd happened to be — the
+        repo root, for any caller that did not set out_dir/output_dir.
+        """
         if not self.src_patches:
+            return
+        if out_dir is None:
+            log.debug(f"  [{split_name}] no out_dir — skipping patch grid")
             return
         out = Path(out_dir) / 'patch_grids'
         out.mkdir(parents=True, exist_ok=True)
@@ -668,6 +676,17 @@ def build_loaders(cfg: Dict) -> Tuple[DataLoader, DataLoader]:
     Prints a sample patch grid per split to cfg['out_dir']/patch_grids/.
     """
     train_pairs, val_pairs, _ = find_pairs_and_split(cfg)
+
+    # Capacity probe: shrink the TRAIN set only, leaving val/test as they are so
+    # the run stays comparable to every other run's validation numbers. Cases are
+    # taken in split order (already a seeded permutation), so the subset is
+    # reproducible and nested — max_train_cases=5 is the first 5 of the 10.
+    n_cap = cfg.get('max_train_cases')
+    if n_cap and n_cap < len(train_pairs):
+        log.warning(f"max_train_cases={n_cap}: training on {n_cap} of "
+                    f"{len(train_pairs)} cases — CAPACITY PROBE, not a "
+                    f"comparable run")
+        train_pairs = train_pairs[:n_cap]
 
     train_ds = CTPairDataset(
         train_pairs,

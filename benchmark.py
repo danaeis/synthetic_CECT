@@ -43,7 +43,10 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / 'orgFeatXGB_CTPhase'))
+# append, NOT insert(0, ...): orgFeatXGB_CTPhase has its own train.py, and putting
+# it first on sys.path shadows this repo's train.py for anything imported later in
+# the same process.
+sys.path.append(str(Path(__file__).resolve().parent / 'orgFeatXGB_CTPhase'))
 import metrics as M
 from phase_eval import PhaseEvaluator, aggregate            # reused verbatim
 from organ_features import load_organ_label_map             # noqa: F401 (PhaseEvaluator uses it)

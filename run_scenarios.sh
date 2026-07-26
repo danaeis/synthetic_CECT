@@ -48,6 +48,38 @@ SCENARIOS=(
   # E: HU-profile without the per-voxel organ term — isolates how much of the
   # gain is the LEVEL constraint vs the texture weighting.
   "l1_huprofile_only|--use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --use_hu_profile"
+
+  # ── Gate B: capacity probes ────────────────────────────────────────────────
+  # Why these exist. Reading the 45-epoch seed runs: raw train L1 flattens at
+  # 0.0139 (~8.3 HU) while val MAE sits at 0.0148 (~8.9 HU) — a 6% gap. There is
+  # no overfitting, so regularisation/augmentation is not the lever. The model
+  # cannot fit its OWN training data below ~8 HU, and these separate the three
+  # candidate reasons: capacity, optimisation, or the data (registration error).
+  #
+  # B1 is decisive. 5 cases, no dropout, L1 only, 200 epochs, no early stop:
+  #   train MAE  -> <2 HU   capacity is sufficient; the ceiling is data/optimisation,
+  #                         and attention's role would be inductive bias, not params
+  #   train MAE plateaus >10 HU   capacity or optimisation IS the bottleneck; fix
+  #                         width/depth before adding anything
+  # Run scripts/audit_data_ceiling.py FIRST — if per-case error tracks bone-HU
+  # misregistration, an 8.3 HU floor is the data's and none of this has headroom.
+  "capacity_overfit|--max_train_cases 5 --dropout 0.0 --epochs 200 --no_early_stop"
+
+  # B2/B4: width sweep. base_ch 64 already exists as l1_organ_curriculum, so only
+  # 32 and 96 are new. Flat 32≈64≈96 means capacity is not binding. Either way,
+  # base_ch=96 (~30.0M vs 13.3M) is the parameter-matched control that any
+  # attention claim must beat — a reviewer asks for it first.
+  "width32|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --base_ch 32"
+  "width96|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --base_ch 96"
+
+  # ── Gate D: pre-measured architecture hypothesis ──────────────────────────
+  # GroupNorm addresses TWO measured symptoms of one cause, at the cost of one
+  # flag: seam is 1.34-1.67 for every model and never near 1.0
+  # (norm_attribution.py: instance drift@shift32 13.98 HU vs group 6.83 HU), and
+  # scripts/erf.py shows instance/group norm couple the whole patch into every
+  # output pixel (r50 14 px -> 4 px moving to group). See
+  # analysis/texture_consistency_findings.md.
+  "l1_organ_groupnorm|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --generator_norm group"
   # add more scenarios here, format: "name|--flag1 --flag2 ..."
 )
 

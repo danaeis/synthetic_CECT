@@ -29,7 +29,7 @@ thesis finding, not a failure. If neither does, the residual is model capacity
 and scaling up is justified.
 
 Usage:
-    python audit_data_ceiling.py \
+    python scripts/audit_data_ceiling.py \
         --manifest ../out_synthesis_train/literature_baseline_l1_organ_curriculum/phase_infer/manifest.csv \
         --report   ../out_synthesis_train/literature_baseline_l1_organ_curriculum/phase_infer/phase_eval_report.json
 """

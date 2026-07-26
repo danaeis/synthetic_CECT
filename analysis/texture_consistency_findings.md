@@ -99,7 +99,7 @@ live:
 1. `python benchmark.py --runs_dir ../out_synthesis_train --weights ...` — the five
    existing runs on the new columns. The expected result, which validates the whole
    exercise, is that `l1_only` is **worst** on `raps_hf`/`grad_w1` while leading PSNR.
-2. `python norm_attribution.py --scenario_dir <run>` on a trained checkpoint — the
+2. `python scripts/norm_attribution.py --scenario_dir <run>` on a trained checkpoint — the
    number that decides whether `GEN_NORM` must change. High DC fraction ⇒ retrain;
    low ⇒ `--blend hann` suffices.
 3. Re-infer one run with `--blend hann` and re-measure `seam`. If it does not
@@ -109,3 +109,54 @@ Local caveat: `smoke_test.py` fails every scenario that builds `PerceptualLoss`
 (`No module named 'torchvision'`) — a local environment gap, unrelated to these
 changes. The `l1_only` and `3d_l1_only` scenarios, which exercise the modified
 generator construction on both paths, pass.
+
+---
+
+## Update 2026-07-26 — the seam and the receptive field are one mechanism
+
+`scripts/erf.py` backpropagates from a single centre output pixel and measures
+where the input gradient lives. Run at identical init, patch 256, base_ch 64,
+varying only the norm layer:
+
+| norm | support radius | r50 | r95 | nonzero pixels |
+|---|---|---|---|---|
+| instance (current default) | **128 = patch/2** | 14 | 105 | 100.0% |
+| group | **128 = patch/2** | 4 | 82 | 100.0% |
+| batch (eval, fixed stats) | **94** | 2 | 4 | 53.9% |
+
+Under instance and group norm the support radius equals `patch/2` at **every**
+patch size tried — r95 was 54 / 105 / 157 px at patch 128 / 256 / 384, a constant
+82% of `patch/2`. A receptive field does not scale with the input. This is the
+normalisation: instance and group statistics are computed over the patch's own
+spatial extent, so every input pixel reaches every output pixel through them, and
+the reach grows with the patch without bound.
+
+Only batch norm exposes the architecture's real field: support radius 94 px, a
+189-px box — **wider** than the ~140 px usually quoted for a 4-level U-Net.
+
+**This is the same mechanism as `seam_energy`, observed from the gradient side
+instead of the output side.** The norm-attribution numbers above (instance
+drift@shift32 13.98 HU / 30.2% vs group 6.83 HU / 25.6%) and this ERF measurement
+are two symptoms of one cause: the tile's own statistics enter every output voxel.
+That is why `seam` is 1.34–1.67 for every model trained so far and never
+approaches 1.0, regardless of loss configuration.
+
+Two consequences for the roadmap.
+
+1. **The ERF argument cannot be used against attention here.** "Convolution
+   already spans the patch, so a long-range module adds nothing" fails, because
+   the apparent global reach is a per-channel *scalar* (the patch mean/std)
+   leaking everywhere — it carries no spatial structure. Attention carries
+   structured spatial relations; the two are not substitutes, and the ERF number
+   does not adjudicate between them. Patch geometry has to be decided on
+   physical field-of-view grounds instead.
+2. **`GEN_NORM='group'` is now a two-symptom hypothesis, not a one-off seam
+   tweak.** It should reduce `seam` *and* narrow the spurious coupling (r50 drops
+   14 → 4 px). Cheapest high-value run available: one flag, no code change.
+
+Caveat: measured at random init. Under batch norm r95 = 4 px while support = 94
+px, meaning gradient mass sits almost entirely on the shallow enc1→dec1 skip — an
+untrained U-Net is dominated by its shortest path, and training is what pushes
+signal deeper. The mass radii are therefore a **lower bound** on a trained
+model's. Re-run `scripts/erf.py --scenario_dir <run>` on the training host, where
+the checkpoints live.

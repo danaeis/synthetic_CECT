@@ -13,6 +13,10 @@ from pathlib import Path
 import numpy as np
 import nibabel as nib
 
+# Repo modules live one level up (this file sits in scripts/ or tests/).
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
 from dataset import CTPairDataset
 
 D, H, W = 4, 256, 256

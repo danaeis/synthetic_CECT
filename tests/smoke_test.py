@@ -16,7 +16,7 @@ running this is offline, those scenarios will FAIL with a clear
 constraint, not a code bug.
 
 Usage:
-    python smoke_test.py
+    python tests/smoke_test.py
 """
 
 import copy
@@ -28,6 +28,10 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader, Dataset
+
+# Repo modules live one level up (this file sits in scripts/ or tests/).
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from config import train_config
 from trainer import Trainer

@@ -20,8 +20,8 @@ Reads only files already on disk — no GPU, no re-inference:
     phase_infer/phase_eval_report.json
 
 Usage:
-    python analyze_runs.py --runs_dir ../out_synthesis_train
-    python analyze_runs.py --runs_dir ../out_synthesis_train \
+    python scripts/analyze_runs.py --runs_dir ../out_synthesis_train
+    python scripts/analyze_runs.py --runs_dir ../out_synthesis_train \
         --baseline literature_baseline_l1_only --out analysis/
 """
 

@@ -39,10 +39,10 @@ is the one reported first, and it is the one that decides.
 
 Usage:
     # trained model from a run (the number that matters)
-    python norm_attribution.py --scenario_dir ../out_synthesis_train/literature_baseline_l1_adv_organ
+    python scripts/norm_attribution.py --scenario_dir ../out_synthesis_train/literature_baseline_l1_adv_organ
 
     # architecture comparison at equal (random) init, no checkpoint needed
-    python norm_attribution.py --data_dir <dir> --compare_norms
+    python scripts/norm_attribution.py --data_dir <dir> --compare_norms
 """
 
 import argparse
@@ -53,6 +53,10 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import torch
+
+# Repo modules live one level up (this file sits in scripts/ or tests/).
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from dataset import _load_vol, find_pairs_and_split
 from models import NORM_KINDS, UNetGenerator

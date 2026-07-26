@@ -2,6 +2,10 @@
 
 import numpy as np
 
+# Repo modules live one level up (this file sits in scripts/ or tests/).
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
 import metrics as M
 
 _ok = True

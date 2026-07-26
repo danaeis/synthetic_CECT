@@ -91,6 +91,15 @@ MAX_FOCUS_CAND_PER_VOL = 3000
 MAX_TRAIN_PATCHES = 20_000
 MAX_VAL_PATCHES   =  4_000
 
+# Cap on the number of TRAIN cases (None = use all 97). Val/test are never
+# capped, so a capped run's validation numbers stay comparable to a full run's.
+# This is a capacity probe, not a training knob: with ~5 cases, dropout 0 and L1
+# alone, a model with sufficient capacity should drive TRAIN error to near zero.
+# The current runs flatten at raw train L1 0.0139 (≈8.3 HU) against val MAE
+# 0.0148 — a 6% gap, so nothing is overfitting and the ceiling is capacity,
+# optimisation, or the data (registration error). This separates those.
+MAX_TRAIN_CASES   = None
+
 # ── Train/val/test split ─────────────────────────────────────────────────────
 VAL_SPLIT  = 0.15
 TEST_SPLIT = 0.15
@@ -138,7 +147,7 @@ GEN_DROPOUT  = 0.20
 #
 # Left at 'instance' so existing checkpoints keep loading — a run's own
 # run_config.json carries this forward to inference. Quantify before switching:
-#     python norm_attribution.py --scenario_dir <run>
+#     python scripts/norm_attribution.py --scenario_dir <run>
 GEN_NORM     = 'instance'
 
 # ── Baseline loss flags (pix2pixHD combination) ───────────────────────────────
@@ -453,6 +462,7 @@ train_config: dict = dict(
     # RAM budget
     max_train_patches    = MAX_TRAIN_PATCHES,
     max_val_patches      = MAX_VAL_PATCHES,
+    max_train_cases      = MAX_TRAIN_CASES,
     # split
     val_split            = VAL_SPLIT,
     test_split           = TEST_SPLIT,
