@@ -149,11 +149,19 @@ class Trainer:
         dims = config.get('dims', 2)
 
         # ── models ──────────────────────────────────────────────────────────
+        # n_phases comes from the configured phase list, so a 3-phase run needs
+        # no code change here.
+        _phases = (config.get('target_phases')
+                   or [config.get('target_phase', 'venous')])
         self.G = UNetGenerator(
             dims          = dims,
             base_channels = config['generator_base_channels'],
             dropout       = config.get('generator_dropout', 0.2),
             norm          = config.get('generator_norm', 'instance'),
+            in_channels   = config.get('in_channels', 1),
+            use_phase_cond= config.get('use_phase_cond', False),
+            n_phases      = max(2, len(_phases)),
+            cond_dim      = config.get('phase_cond_dim', 64),
         ).to(self.device)
 
         self.use_adv = config.get('use_adversarial', True)
@@ -218,7 +226,12 @@ class Trainer:
             'val_loss',
             'val_mae', 'val_psnr', 'val_ssim', 'val_ncc',              # global
             'val_org_mae', 'val_org_psnr', 'val_org_ssim', 'val_org_ncc',  # organ-region
-        ]}
+        ] + ([
+            # Mean |gamma| per FiLM site. This is a RESULT, not diagnostics: if
+            # gamma converges to ~0 the decoder learned to ignore the phase
+            # input, i.e. conditioning bought nothing.
+            f'gamma_{s}' for s in ('bottleneck', 'dec4', 'dec3', 'dec2', 'dec1')
+        ] if config.get('use_phase_cond', False) else [])}
 
         # Per-organ metrics: id→name map (from the CTPhase-XGBoost dump so organ
         # names match that phase model). Missing/unset → per-organ reported by
@@ -271,17 +284,33 @@ class Trainer:
         return loss_D.item(), real_feats
 
     # -----------------------------------------------------------------------
+    def _phase(self, batch: Dict):
+        """Phase ids for this batch, or None when the generator is unconditioned.
+
+        The dataset always emits 'phase', so this is the single place that
+        decides whether it is used — passing it to a generator built with
+        use_phase_cond=False raises rather than being silently ignored.
+        """
+        if not getattr(self.G, 'use_phase_cond', False):
+            return None
+        ph = batch.get('phase')
+        if ph is None:
+            raise KeyError("generator has use_phase_cond=True but the batch has "
+                           "no 'phase' key — stale patch cache? delete it and re-preload")
+        return ph.to(self.device)
+
     def _train_step(self, batch: Dict) -> Dict:
         source = batch['source'].to(self.device)
         target = batch['target'].to(self.device)
         mask   = batch['mask'].to(self.device) if 'mask' in batch else None
+        phase  = self._phase(batch)
 
         # Generator forward for the discriminator's fake input only — no_grad
         # because it is immediately detached; avoids building an autograd
         # graph that would just be discarded (halves G forward-passes/step).
         if self.D is not None and (self.global_step % self.disc_freq == 0):
             with torch.no_grad(), autocast('cuda', enabled=self.use_amp):
-                fake_for_d = self.G(source)
+                fake_for_d = self.G(source, phase)
             loss_D_val, real_feats = self._disc_step(target, fake_for_d)
         else:
             loss_D_val, real_feats = 0.0, None
@@ -289,7 +318,7 @@ class Trainer:
         # Generator step (re-forward so gradients flow)
         self.opt_G.zero_grad()
         with autocast('cuda', enabled=self.use_amp):
-            fake = self.G(source)
+            fake = self.G(source, phase)
 
             adv_logits = None
             fake_feats = None
@@ -298,7 +327,10 @@ class Trainer:
 
             cycle_pred = None
             if self.use_cycle:
-                cycle_pred = self.G(fake)            # fake → G → should ≈ source
+                # G(G(source)): the intermediate is a synthetic CECT, so its
+                # "phase" is ill-defined. Reusing the target phase is a
+                # convention, not a derivation — use_cycle is off by default.
+                cycle_pred = self.G(fake, phase)     # fake → G → should ≈ source
 
             loss_G, ld = self.criterion(
                 pred            = fake,
@@ -352,7 +384,7 @@ class Trainer:
             tgt = batch['target'].to(self.device)
             mask = batch.get('mask')
             with autocast('cuda', enabled=self.use_amp):
-                fake = self.G(src)
+                fake = self.G(src, self._phase(batch))
             for i in range(src.size(0)):
                 p = _center_flat(fake[i]).astype(np.float64)
                 t = _center_flat(tgt[i]).astype(np.float64)
@@ -460,7 +492,7 @@ class Trainer:
             batch = torch.utils.data.default_collate([ds[i] for i in idx])
             src = batch['source'].to(self.device)
             tgt = batch['target'].to(self.device)
-            fake = self.G(src)
+            fake = self.G(src, self._phase(batch))
 
         n = src.size(0)
         case_ids = getattr(ds, 'case_ids', None)
@@ -656,6 +688,9 @@ class Trainer:
                   'val_mae', 'val_psnr', 'val_ssim', 'val_ncc',
                   'val_org_mae', 'val_org_psnr', 'val_org_ssim', 'val_org_ncc']:
             h[k].append(val.get(k, 0.0))
+        for k, v in self.G.film_stats().items():
+            if k in h:
+                h[k].append(v)
 
     def _save_history(self):
         hist = {k: [float(v) for v in vl] for k, vl in self.history.items()}

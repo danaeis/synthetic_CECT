@@ -44,7 +44,16 @@ a pair only if it has both a non-contrast and the `target_phase` volume.
 
 Case-level split (no patient leakage) via
 `np.random.default_rng(data_seed).permutation`. **137 pairs → 97 train / 20 val /
-20 test** at `val_split=test_split=0.15`, `data_seed=42`. Materialized to
+20 test** at `val_split=test_split=0.15`, `data_seed=42`.
+
+`target_phases` (list) generalises `target_phase` (scalar): it emits one pair per
+(case, available phase) — 137 venous + 136 arterial. The split is over **cases**,
+built as a list of per-case pair lists, so every phase of a patient lands in the
+same split. Case membership is decided by `target_phases[0]` alone, so a
+multi-phase run reproduces the single-phase split case-for-case, which is what
+keeps it comparable to the runs already in `analysis/`. Each pair carries `phase`
+and `phase_id`; `phase_id` keys on the **target** path, since the same NCCT is the
+source for every phase of a case. Materialized to
 `splits/split.json` by `scripts/dump_split.py` — the contract external benchmark
 models read.
 
@@ -63,8 +72,11 @@ Three phases in `__init__`:
 `load_mask = use_organ or use_seg_consistency` — segmentation volumes are only read
 when one of those is on.
 
-`__getitem__` is a pure array lookup returning `{'source', 'target'}` (+ `'mask'`
-if masks were loaded). **No augmentation of any kind exists.**
+`__getitem__` is a pure array lookup returning `{'source', 'target', 'phase'}`
+(+ `'mask'` if masks were loaded). `phase` is always present — 0 for single-phase
+runs — so the batch schema does not change with the flag; the trainer forwards it
+only when the generator was built with `use_phase_cond`. **No augmentation of any
+kind exists.**
 
 ⚠ **Silent failure modes.** If a mask's shape does not match its volume, that
 patch's mask stays all-zero with no warning (`dataset.py:452`), and organ-focus
@@ -81,8 +93,8 @@ Raising it changes the cache key.
 ### On-disk patch cache
 `_cache_path` md5-hashes everything determining content: the sorted pair list,
 patch geometry, validity thresholds, `hu_min/hu_max`, `max_patches`, `data_seed`,
-`load_mask`, `mask_multilabel`, `seg_suffix`, `split_name`, and the organ-focus
-knobs when `frac > 0`. Located under `cfg['cache_dir']`, **independent of
+`load_mask`, `mask_multilabel`, `seg_suffix`, `split_name`, `target_phases`, and
+the organ-focus knobs when `frac > 0`. Located under `cfg['cache_dir']`, **independent of
 `output_dir`**, so scenarios differing only in loss flags share one cache. Organ
 weight *values* are deliberately excluded — they apply in the loss, so re-tuning
 must not force a re-preload.
@@ -91,11 +103,16 @@ must not force a re-preload.
 the pair list (as `max_train_cases` does) changes it automatically because `pairs`
 is hashed; a transform applied *during* preload would not.
 
-### No spatial resampling
+### No spatial resampling — and none needed
 `_load_vol` is `nib.load(path).get_fdata()` + transpose. Nothing reads voxel
 spacing anywhere in the pipeline; `affine`/`header` are used only to write output
-back out (`infer_volume.py:261-269`). A 128-px patch therefore covers a physically
-different field of view per case. See `PROJECT_PLAN.md` §1.5.
+back out (`infer_volume.py:261-269`).
+
+This was flagged as a risk (a patch would span different physical extents per
+case), but `scripts/spacing_stats.py` measured all 274 volumes at **exactly
+1.5 × 1.5 × 1.5 mm**, max/min = 1.00× on every axis — the data was resampled
+isotropically upstream. A 128-px patch is 192 mm in every case. Resampling is
+therefore unnecessary; do not add it without re-measuring first.
 
 ---
 
@@ -111,8 +128,33 @@ factories.
 Output is **`Sigmoid`**, matching the dataset's `[0,1]` range (was `Tanh`, which
 wasted its negative half and saturated near the targets).
 
-**Input channels are hardcoded to 1** (`models.py:154`) — a 2.5-D multi-slice input
-needs an `in_channels` argument added.
+`in_channels` defaults to 1; set it to `2k+1` to feed a stack of adjacent axial
+slices ("2.5-D") and predict the centre slice. The output stays 1 channel.
+
+### Phase conditioning (FiLM) — `use_phase_cond`, off by default
+`forward(x, phase=None)`. When enabled, a `nn.Embedding(n_phases, cond_dim)` drives
+a `FiLM` block (`models.py`) after the bottleneck and after each of
+`dec4/dec3/dec2/dec1`: `y = x * (1 + gamma(c)) + beta(c)`, per-channel and
+spatially uniform. **Decoder only** — the encoder stays phase-agnostic and learns
+anatomy from every phase's pairs. +223,744 params (+1.7%), so a measured gain
+cannot be attributed to capacity.
+
+The last FiLM layer is **zero-initialised**, so at step 0 the conditioned model is
+bitwise equal to the unconditioned one; it can therefore be fine-tuned from a
+baseline checkpoint. `G.film_stats()` returns mean |gamma| per site and the
+trainer logs it to `history.json` as `gamma_*` — that is a **result**, not
+diagnostics: gamma staying at ~0 means the decoder learned to ignore the phase.
+
+Two invariants, both asserted in `tests/test_phase_cond.py`:
+- With `use_phase_cond=False` **no conditioning module is constructed at all**.
+  Building one draws from the global RNG, which would shift the init of every
+  later layer and silently change baseline results under a fixed seed. The test
+  compares state dicts tensor-by-tensor.
+- The FiLM broadcast is rank-agnostic (`x.ndim`), so `dims=3` works unchanged. A
+  literal `.view(B, C, 1, 1)` passes in 2-D and breaks the first 3-D run.
+
+Passing `phase` to an unconditioned model (or omitting it for a conditioned one)
+raises rather than being silently ignored.
 
 Parameters are heavily back-loaded:
 
@@ -289,6 +331,9 @@ scenario definitions** — those are the `SCENARIOS` array in `run_scenarios.sh`
 | `LAMBDA_ORGAN` | `20` (was 5, where the organ term peaked at 21% of L1) |
 | `EARLY_STOP_PATIENCE` | `30` |
 | `SEG_SUFFIX` | must stay `'_seg_full'` — `_seg_reg` uses different label ids |
+| `TARGET_PHASES` | `['venous']`; add `'arterial'` to train one model on both |
+| `USE_PHASE_COND` / `PHASE_COND_DIM` | `False` / `64` |
+| `IN_CHANNELS` | `1` (`2k+1` for a 2.5-D slice stack) |
 
 Seeding is complete: `set_seed()` at `train.py:45` covers `random`/`numpy`/`torch`
 and the cuDNN determinism flags, `dataset.py:690` passes a `torch.Generator` and
@@ -343,6 +388,8 @@ never loads in current runs.
 python scripts/analyze_runs.py --runs_dir ../out_synthesis_train --out analysis/
 python scripts/seeds_stats.py           # mean ± std across _s<N> replicates
 python scripts/audit_data_ceiling.py    # is the residual the model's or the data's?
+python scripts/spacing_stats.py         # voxel spacing -> physical patch FOV
+python scripts/audit_enhancement.py     # does the model track each case's contrast level?
 python scripts/capacity_profile.py      # per-module params, VRAM, patch/s
 python scripts/erf.py --compare_norms   # effective receptive field
 python scripts/norm_attribution.py      # seam attribution per norm kind
@@ -358,6 +405,7 @@ scenarios need `torchvision`.
 python tests/test_metrics.py            # 15 checks
 python tests/test_patch_cache.py        # 9 checks — cache correctness
 python tests/test_max_train_cases.py    # 9 checks — probe caps train only, cache key differs
+python tests/test_phase_cond.py         # 19 checks — FiLM no-op/zero-init, dims=3, no leakage
 python tests/smoke_test_organ_weights.py
 python tests/smoke_test_organ_focus.py
 python tests/smoke_test.py              # 12 loss scenarios, GPU-free

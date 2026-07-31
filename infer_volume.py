@@ -52,11 +52,16 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def load_generator(ckpt_path: str, cfg: Dict, device: str) -> UNetGenerator:
+    _phases = cfg.get('target_phases') or [cfg.get('target_phase', 'venous')]
     G = UNetGenerator(
         dims          = cfg.get('dims', 2),
         base_channels = cfg['generator_base_channels'],
         dropout       = cfg.get('generator_dropout', 0.2),
         norm          = cfg.get('generator_norm', 'instance'),
+        in_channels   = cfg.get('in_channels', 1),
+        use_phase_cond= cfg.get('use_phase_cond', False),
+        n_phases      = max(2, len(_phases)),
+        cond_dim      = cfg.get('phase_cond_dim', 64),
     ).to(device)
     # weights_only=False: checkpoints also carry non-tensor state (history,
     # early_stop, ...); we only read G_state but must be able to unpickle them.
@@ -117,7 +122,8 @@ def _axis_window(n: int, mode: str, margin: int,
 @torch.no_grad()
 def infer_volume(G: UNetGenerator, vol_dhw: np.ndarray, cfg: Dict, device: str,
                  batch_size: int = 32, blend: str = 'hann',
-                 edge_margin: int = 0, overlap: Optional[float] = None) -> np.ndarray:
+                 edge_margin: int = 0, overlap: Optional[float] = None,
+                 phase_id: Optional[int] = None) -> np.ndarray:
     """Reconstruct a full synthetic CECT volume (HU, (D,H,W)) from an NCCT volume.
 
     Weighted overlap-blending. Patches are normalised/denormalised with the run's
@@ -188,8 +194,13 @@ def infer_volume(G: UNetGenerator, vol_dhw: np.ndarray, cfg: Dict, device: str,
         if not buf_patch:
             return
         batch = torch.from_numpy(np.stack(buf_patch)).unsqueeze(1).to(device)  # (B,1,...)
+        # Phase is per-tile and constant across the volume, so it is broadcast to
+        # the batch here rather than carried through the tiling bookkeeping.
+        ph_t = (torch.full((batch.shape[0],), int(phase_id),
+                           dtype=torch.long, device=device)
+                if getattr(G, 'use_phase_cond', False) else None)
         with torch.autocast('cuda', enabled=use_amp):
-            out = G(batch)
+            out = G(batch, ph_t)
         out = out.squeeze(1).float().cpu().numpy()   # (B, ...) in [0,1]
         for (d0, y0, x0), o in zip(buf_coord, out):
             w = _window(d0, y0, x0)
@@ -248,38 +259,52 @@ def run(scenario_dir: str, split: str, out_dir: str, ckpt_name: str,
     log.info(f"Inferring {len(pairs)} {split} case(s) for scenario '{sdir.name}'")
 
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
-    target_phase = cfg.get('target_phase', 'venous')
-    rows = []
+    default_phase = cfg.get('target_phase', 'venous')
+    # One manifest per phase. A multi-phase model emits several volumes per case,
+    # which would collide on '{case_id}_syn.nii.gz' in a single directory, and
+    # each phase has to be phase-scored against its own target anyway. Runs with
+    # one phase keep exactly the previous flat layout.
+    phases = sorted({p.get('phase', default_phase) for p in pairs})
+    multi = len(phases) > 1
+    rows_by_phase = {ph: [] for ph in phases}
     n_no_mask = 0
+
     for pair in pairs:
         case_id = pair['case_id']
         seg_path = pair.get('seg_path')
+        ph = pair.get('phase', default_phase)
         if not seg_path:
             n_no_mask += 1
-            log.warning(f"  {case_id}: no {cfg.get('seg_suffix','_seg_reg')} mask — skipping (can't phase-score)")
+            log.warning(f"  {case_id} [{ph}]: no {cfg.get('seg_suffix','_seg_reg')} mask — skipping (can't phase-score)")
             continue
+        pdir = (out / ph) if multi else out
+        pdir.mkdir(parents=True, exist_ok=True)
         src_nii = nib.load(pair['source_path'])
         src_dhw = _load_vol(pair['source_path'])
         syn_hu_dhw = infer_volume(G, src_dhw, cfg, device, batch_size=batch_size,
-                                  blend=blend, edge_margin=edge_margin, overlap=overlap)
+                                  blend=blend, edge_margin=edge_margin, overlap=overlap,
+                                  phase_id=pair.get('phase_id', 0))
         # back to native (X,Y,Z) orientation to match real/mask that phase_eval
         # loads raw; save on the source grid/affine.
         syn_xyz = np.transpose(syn_hu_dhw, (2, 1, 0)).astype(np.float32)
-        gen_path = out / f'{case_id}_syn.nii.gz'
+        gen_path = pdir / f'{case_id}_syn.nii.gz'
         nib.save(nib.Nifti1Image(syn_xyz, src_nii.affine, src_nii.header), str(gen_path))
-        rows.append({'gen_path': str(gen_path), 'real_path': pair['target_path'],
-                     'mask_path': seg_path, 'target_phase': target_phase})
-        log.info(f"  {case_id}: saved {gen_path.name}")
+        rows_by_phase[ph].append({'gen_path': str(gen_path),
+                                  'real_path': pair['target_path'],
+                                  'mask_path': seg_path, 'target_phase': ph})
+        log.info(f"  {case_id} [{ph}]: saved {gen_path.name}")
 
-    manifest = out / 'manifest.csv'
-    with open(manifest, 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=['gen_path', 'real_path', 'mask_path', 'target_phase'])
-        w.writeheader(); w.writerows(rows)
-    log.info(f"Wrote {len(rows)} rows → {manifest}"
-             + (f"  ({n_no_mask} skipped, no mask)" if n_no_mask else ""))
-    log.info(f"Next: python <CTPhase-XGBoost>/phase_eval.py --weights <xgb_vindr_full.pkl> "
-             f"--manifest {manifest} --gen_in_hu --hu_min {cfg.get('hu_min',-200)} "
-             f"--hu_max {cfg.get('hu_max',400)} --out_json {out/'phase_eval_report.json'}")
+    for ph, rows in rows_by_phase.items():
+        pdir = (out / ph) if multi else out
+        manifest = pdir / 'manifest.csv'
+        with open(manifest, 'w', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=['gen_path', 'real_path', 'mask_path', 'target_phase'])
+            w.writeheader(); w.writerows(rows)
+        log.info(f"Wrote {len(rows)} rows → {manifest}"
+                 + (f"  ({n_no_mask} skipped, no mask)" if n_no_mask else ""))
+        log.info(f"Next: python <CTPhase-XGBoost>/phase_eval.py --weights <xgb_vindr_full.pkl> "
+                 f"--manifest {manifest} --gen_in_hu --hu_min {cfg.get('hu_min',-200)} "
+                 f"--hu_max {cfg.get('hu_max',400)} --out_json {pdir/'phase_eval_report.json'}")
 
 
 def main():

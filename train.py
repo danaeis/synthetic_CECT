@@ -118,6 +118,16 @@ def _parse():
     p.add_argument('--no_early_stop', action='store_true',
                    help='disable early stopping (probe runs must reach the plateau)')
 
+    # ── Phase conditioning (multi-phase training) ────────────────────────────
+    p.add_argument('--target_phases', type=str, nargs='+', default=None,
+                   help='phases to synthesise, e.g. --target_phases venous arterial. '
+                        'The FIRST decides case membership, so the train/val/test '
+                        'split matches a single-phase run on that phase.')
+    p.add_argument('--phase_cond_dim', type=int, default=None,
+                   help='width of the phase embedding (default 64)')
+    p.add_argument('--in_channels', type=int, default=None,
+                   help='generator input channels; 2k+1 for a 2.5-D slice stack')
+
     p.add_argument('--perceptual_backbone', type=str, default=None, choices=['vgg', 'dino'])
     p.add_argument('--saliency_mode',       type=str, default=None, choices=['heuristic', 'dino'])
 
@@ -144,7 +154,7 @@ def _parse():
     for flag in ['adversarial', 'perceptual', 'feature_matching',
                  'ssim', 'gradient', 'frequency',
                  'organ', 'saliency', 'cycle', 'seg_consistency',
-                 'l1_decay', 'per_organ_weights', 'hu_profile']:
+                 'l1_decay', 'per_organ_weights', 'hu_profile', 'phase_cond']:
         g = p.add_mutually_exclusive_group()
         g.add_argument(f'--use_{flag}',  dest=f'use_{flag}', action='store_true', default=None)
         g.add_argument(f'--no_{flag}',   dest=f'use_{flag}', action='store_false')
@@ -169,7 +179,13 @@ def _apply(cfg: dict, args) -> dict:
     if args.no_early_stop:           c['early_stop_patience']     = 10 ** 9
     if args.perceptual_backbone is not None: c['perceptual_backbone'] = args.perceptual_backbone
     if args.saliency_mode       is not None: c['saliency_mode']       = args.saliency_mode
+    if args.target_phases is not None:
+        c['target_phases'] = args.target_phases
+        # Keep the scalar in step: it is what the manifest, the phase evaluator
+        # and every existing run_config.json read.
+        c['target_phase'] = args.target_phases[0]
     for k in ['selection_metric', 'sample_mode', 'sample_n', 'max_train_cases',
+              'phase_cond_dim', 'in_channels',
               'lambda_organ', 'lambda_hu_profile', 'lambda_l1_floor',
               'l1_decay_start_epoch', 'l1_decay_end_epoch',
               'adv_warmup_epochs', 'lr_disc', 'seed', 'data_seed']:
@@ -179,7 +195,7 @@ def _apply(cfg: dict, args) -> dict:
     for flag in ['adversarial', 'perceptual', 'feature_matching',
                  'ssim', 'gradient', 'frequency',
                  'organ', 'saliency', 'cycle', 'seg_consistency',
-                 'l1_decay', 'per_organ_weights', 'hu_profile']:
+                 'l1_decay', 'per_organ_weights', 'hu_profile', 'phase_cond']:
         v = getattr(args, f'use_{flag}', None)
         if v is not None:
             c[f'use_{flag}'] = v

@@ -160,3 +160,53 @@ untrained U-Net is dominated by its shortest path, and training is what pushes
 signal deeper. The mass radii are therefore a **lower bound** on a trained
 model's. Re-run `scripts/erf.py --scenario_dir <run>` on the training host, where
 the checkpoints live.
+
+---
+
+## Update 2026-07-27 — trained-weight measurements
+
+### Norm attribution on a trained model (was random-init only)
+
+`scripts/norm_attribution.py --scenario_dir literature_baseline_l1_organ_curriculum`
+(epoch 39, `norm=instance`, output std 125.97 HU):
+
+| shift | total HU | DC HU | resid HU | DC frac | drift/std |
+|---|---|---|---|---|---|
+| 4 | 2.65 | 1.19 | 2.69 | 44.8% | 2.1% |
+| 8 | 3.50 | 1.66 | 3.42 | 47.5% | 2.8% |
+| 16 | 3.65 | 2.12 | 3.37 | 58.1% | 2.9% |
+| 32 | **4.99** | **3.22** | 4.37 | **64.5%** | 4.0% |
+
+Against the random-init baseline (13.98 HU total, 32.4% DC), training **cut
+absolute drift 4.3× but doubled the DC fraction**. The disagreement that survives
+training is almost entirely a constant offset — exactly the component
+overlap-blending cannot cancel, and exactly the InstanceNorm signature.
+
+This makes `GEN_NORM='group'` a *cleaner* call than the random-init numbers
+suggested, not a weaker one: the remaining seam is now almost purely the part that
+the norm choice controls.
+
+### ERF, trained vs random init
+
+`analysis/erf_trained.json` (patch 128, base_ch 64, `norm=instance`, epoch 39):
+
+| | r50 | r95 | support |
+|---|---|---|---|
+| random init | 13 | 54 | 64 (= patch/2) |
+| **trained** | **28** | **59** | 64 (= patch/2) |
+
+Training **more than doubles r50** (13 → 28 px): the model learns to use materially
+wider spatial context than its initialisation. The random-init mass radii reported
+above were therefore a lower bound, as flagged.
+
+Support stays pinned at `patch/2` because `norm=instance` still couples the whole
+patch — the trained measurement does not change that conclusion, it confirms it on
+real weights.
+
+### Spacing — the tiling context, settled
+
+`scripts/spacing_stats.py` over all 274 volumes: **every volume is exactly
+1.5 × 1.5 × 1.5 mm**, max/min = 1.00× on every axis. So `zaniso ≈ 1.09` measured on
+generated volumes is **not** explained by acquisition anisotropy — the data is
+isotropic. It is an artifact of the 2-D architecture predicting each slice
+independently, which is the same root cause as `zflicker`.

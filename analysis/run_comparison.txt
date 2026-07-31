@@ -1,15 +1,25 @@
-Run comparison — 5 scenarios under ../out_synthesis_train
+Run comparison — 15 scenarios under ../out_synthesis_train
 Baseline: l1_only
 
 ====================================================================================================
 1. HEADLINE — each run at its OWN best-selection epoch
 ====================================================================================================
 run                       ep    PSNR     SSIM   oPSNR    oSSIM  phase    prob  featHU
+capacity_overfit          12   28.40   0.9787   24.69   0.9228     --      --      --
 l1_adv                    27   29.33   0.9824   25.72   0.9336   1.00  0.9751   17.85
 l1_adv_organ              37   29.24   0.9822   25.65   0.9340   1.00  0.9794   16.04
+l1_adv_organ_s42          23   29.40   0.9826   25.82   0.9352     --      --      --
+l1_adv_organ_s43          24   29.38   0.9825   25.81   0.9353     --      --      --
+l1_adv_organ_s44          29   29.30   0.9824   25.71   0.9345     --      --      --
 l1_bowel_zero             39   29.75   0.9837   26.14   0.9383   0.95  0.9517   17.39
 l1_only                   41   29.75   0.9837   26.12   0.9375   0.95  0.9484   17.32
 l1_organ_curriculum       39   29.74   0.9837   26.15   0.9385   1.00  0.9792   15.74
+l1_organ_curriculum_s42   29   29.72   0.9836   26.12   0.9387     --      --      --
+l1_organ_curriculum_s43   37   29.74   0.9836   26.14   0.9385     --      --      --
+l1_organ_curriculum_s44   35   29.73   0.9836   26.15   0.9386     --      --      --
+pix2pixhd_baseline        27   29.41   0.9826   25.75   0.9342   0.95  0.9141   17.07
+width32                   36   29.57   0.9830   25.96   0.9366     --      --      --
+width96                   33   29.73   0.9837   26.16   0.9389     --      --      --
 
   oPSNR/oSSIM = organ-region. featHU = mean per-organ |HU error| vs real CECT.
   Judge every difference here against the noise floor in section 2.
@@ -20,13 +30,23 @@ l1_organ_curriculum       39   29.74   0.9837   26.15   0.9385   1.00  0.9792   
   A between-run difference smaller than these is NOT a result.
 
 run                        oSSIM std           oSSIM range   oPSNR std
+capacity_overfit             0.00061   [0.91716,0.91927]      0.0328
 l1_adv                       0.01096   [0.89508,0.93401]      0.8345
-l1_adv_organ                 0.00419   [0.91877,0.93242]      0.4346
+l1_adv_organ                 0.00371   [0.91877,0.93242]      0.3787
+l1_adv_organ_s42             0.00128   [0.93077,0.93518]      0.1407
+l1_adv_organ_s43             0.00089   [0.93230,0.93534]      0.1021
+l1_adv_organ_s44             0.00068   [0.93162,0.93454]      0.0626
 l1_bowel_zero                0.00122   [0.93320,0.93795]      0.0723
 l1_only                      0.00113   [0.93228,0.93713]      0.0646
 l1_organ_curriculum          0.00089   [0.93423,0.93847]      0.1253
+l1_organ_curriculum_s42      0.00034   [0.93737,0.93871]      0.0395
+l1_organ_curriculum_s43      0.00029   [0.93758,0.93852]      0.0496
+l1_organ_curriculum_s44      0.00023   [0.93782,0.93863]      0.0515
+pix2pixhd_baseline           0.00945   [0.90053,0.93379]      0.7761
+width32                      0.00042   [0.93486,0.93665]      0.0535
+width96                      0.00028   [0.93759,0.93890]      0.0342
 
-  Between-run spread of best oSSIM: 0.00493
+  Between-run spread of best oSSIM: 0.01611
   Compare to the within-run std above before claiming any run is better.
 
 ====================================================================================================
@@ -78,24 +98,36 @@ l1_organ_curriculum     feature_l1_hu                      -1.58   -4.22  ***   
                         small_bowel                        -0.26   -0.57   ns   14/20
                         colon                              -0.76   -1.35   ns   12/20
 
+pix2pixhd_baseline      feature_l1_hu                      -0.25   -0.38   ns    9/20
+                        aorta                              -1.16   -0.55   ns   13/20
+                        inferior_vena_cava                 +3.59   +2.92   **    4/20
+                        portal_vein_and_splenic_vein       +0.15   +0.10   ns   10/20
+                        heart                              +1.55   +1.35   ns    7/20
+                        liver                              +1.32   +1.50   ns    8/20
+                        pancreas                           +0.44   +0.44   ns    7/20
+                        pulmonary_vein                     -3.03   -0.81   ns    8/13
+                        small_bowel                        +1.55   +1.71   ns    9/20
+                        colon                              -0.35   -0.46   ns   13/20
+
   sig: * p<.05  ** p<.01  *** p<.001 (two-sided, df~n-1)
 
 ====================================================================================================
 4. CROSS-MODEL PER-CASE CORRELATION — is the error the model, or the data?
 ====================================================================================================
 
-                            l1_adv  l1_adv_org  l1_bowel_z     l1_only  l1_organ_c
-l1_adv                           -       0.973       0.977       0.963       0.966
-l1_adv_organ                 0.973           -       0.975       0.964       0.978
-l1_bowel_zero                0.977       0.975           -       0.983       0.957
-l1_only                      0.963       0.964       0.983           -       0.967
-l1_organ_curriculum          0.966       0.978       0.957       0.967           -
+                            l1_adv  l1_adv_org  l1_bowel_z     l1_only  l1_organ_c  pix2pixhd_
+l1_adv                           -       0.973       0.977       0.963       0.966       0.918
+l1_adv_organ                 0.973           -       0.975       0.964       0.978       0.918
+l1_bowel_zero                0.977       0.975           -       0.983       0.957       0.894
+l1_only                      0.963       0.964       0.983           -       0.967       0.893
+l1_organ_curriculum          0.966       0.978       0.957       0.967           -       0.914
+pix2pixhd_baseline           0.918       0.918       0.894       0.893       0.914           -
 
-  mean r = 0.970  ->  r^2 = 0.942
+  mean r = 0.949  ->  r^2 = 0.901
   between-CASE  spread (std of per-case error):   6.21 HU
-  between-MODEL spread on the same case (mean):    3.24 HU
+  between-MODEL spread on the same case (mean):    4.03 HU
 
-  => r^2=0.94: ~94% of per-case error variance is shared by
+  => r^2=0.90: ~90% of per-case error variance is shared by
      ALL models, i.e. intrinsic to the case, not the loss. The models fail on
      the same cases. Loss engineering is near its ceiling; look at the DATA
      (registration quality, contrast timing) for the remaining headroom.
@@ -103,6 +135,13 @@ l1_organ_curriculum          0.966       0.978       0.957       0.967          
 ====================================================================================================
 5. SCHEDULES — lambda_l1 curriculum and LR restarts
 ====================================================================================================
+
+  capacity_overfit
+    lambda_l1: CONSTANT 100.0  <-- NO-OP
+    LR warm restarts at epochs [45, 135] (T0=45, tmult=2)
+      ep45: oSSIM 0.91244 -> 0.91252 (ok -0.00008)
+      ep135: oSSIM 0.91473 -> 0.91473 (COST +0.00000)
+    reaches within 0.001 of its peak oSSIM at epoch 12 of 200 (188 later epochs added nothing)
 
   l1_adv
     lambda_l1: not recorded (run predates the curriculum)
@@ -116,7 +155,22 @@ l1_organ_curriculum          0.966       0.978       0.957       0.967          
     LR warm restarts at epochs [15, 45] (T0=15, tmult=2)
       ep15: oSSIM 0.92029 -> 0.91556 (COST +0.00473)
       ep45: oSSIM 0.93240 -> 0.91877 (COST +0.01363)
-    reaches within 0.001 of its peak oSSIM at epoch 34 of 65 (31 later epochs added nothing)
+    reaches within 0.001 of its peak oSSIM at epoch 34 of 67 (33 later epochs added nothing)
+
+  l1_adv_organ_s42
+    lambda_l1: 100.0 -> 25.0  (reaches floor at epoch 30, constant for 16/45 epochs)
+    LR warm restarts at epochs [45] (T0=45, tmult=2)
+    reaches within 0.001 of its peak oSSIM at epoch 11 of 45 (34 later epochs added nothing)
+
+  l1_adv_organ_s43
+    lambda_l1: 100.0 -> 25.0  (reaches floor at epoch 30, constant for 16/45 epochs)
+    LR warm restarts at epochs [45] (T0=45, tmult=2)
+    reaches within 0.001 of its peak oSSIM at epoch 17 of 45 (28 later epochs added nothing)
+
+  l1_adv_organ_s44
+    lambda_l1: 100.0 -> 25.0  (reaches floor at epoch 30, constant for 16/45 epochs)
+    LR warm restarts at epochs [45] (T0=45, tmult=2)
+    reaches within 0.001 of its peak oSSIM at epoch 17 of 45 (28 later epochs added nothing)
 
   l1_bowel_zero
     lambda_l1: 100.0 -> 25.0  (reaches floor at epoch 30, constant for 40/69 epochs)
@@ -139,23 +193,55 @@ l1_organ_curriculum          0.966       0.978       0.957       0.967          
       ep46: oSSIM 0.93836 -> 0.93601 (COST +0.00235)
     reaches within 0.001 of its peak oSSIM at epoch 28 of 69 (41 later epochs added nothing)
 
+  l1_organ_curriculum_s42
+    lambda_l1: 100.0 -> 25.0  (reaches floor at epoch 30, constant for 16/45 epochs)
+    LR warm restarts at epochs [45] (T0=45, tmult=2)
+    reaches within 0.001 of its peak oSSIM at epoch 20 of 45 (25 later epochs added nothing)
+
+  l1_organ_curriculum_s43
+    lambda_l1: 100.0 -> 25.0  (reaches floor at epoch 30, constant for 16/45 epochs)
+    LR warm restarts at epochs [45] (T0=45, tmult=2)
+    reaches within 0.001 of its peak oSSIM at epoch 19 of 45 (26 later epochs added nothing)
+
+  l1_organ_curriculum_s44
+    lambda_l1: 100.0 -> 25.0  (reaches floor at epoch 30, constant for 16/45 epochs)
+    LR warm restarts at epochs [45] (T0=45, tmult=2)
+    reaches within 0.001 of its peak oSSIM at epoch 17 of 45 (28 later epochs added nothing)
+
+  pix2pixhd_baseline
+    lambda_l1: not recorded (run predates the curriculum)
+    LR warm restarts at epochs [15, 45] (T0=15, tmult=2)
+      ep15: oSSIM 0.93297 -> 0.93150 (COST +0.00147)
+      ep45: oSSIM 0.93130 -> 0.91457 (COST +0.01673)
+    reaches within 0.001 of its peak oSSIM at epoch 21 of 57 (36 later epochs added nothing)
+
+  width32
+    lambda_l1: 100.0 -> 25.0  (reaches floor at epoch 30, constant for 16/45 epochs)
+    LR warm restarts at epochs [45] (T0=45, tmult=2)
+    reaches within 0.001 of its peak oSSIM at epoch 17 of 45 (28 later epochs added nothing)
+
+  width96
+    lambda_l1: 100.0 -> 25.0  (reaches floor at epoch 30, constant for 16/45 epochs)
+    LR warm restarts at epochs [45] (T0=45, tmult=2)
+    reaches within 0.001 of its peak oSSIM at epoch 14 of 45 (31 later epochs added nothing)
+
 ====================================================================================================
 6. PER-ORGAN SSIM vs "l1_only" at each run's best epoch
 ====================================================================================================
 
   weight column = the tiered scheme from 'l1_adv_organ'
 
-organ                           wt   l1_only      l1_adv  l1_adv_org  l1_bowel_z  l1_organ_c
-aorta                            6    0.8550     -0.0311     -0.0135     -0.0012     +0.0070
-inferior_vena_cava               6    0.7705     -0.0302     -0.0287     +0.0003     -0.0000
-portal_vein_and_splenic_vein     6    0.7232     +0.0054     +0.0026     -0.0008     +0.0020
-heart                            4    0.7030     -0.0202     -0.0292     -0.0051     -0.0150
-liver                            3    0.8362     -0.0217     -0.0222     +0.0005     +0.0009
-pancreas                         2    0.7708     -0.0255     -0.0350     +0.0024     -0.0105
-pulmonary_vein                   4    0.7375     -0.0082     -0.0210     -0.0138     +0.0018
-small_bowel                      0    0.6182     -0.0071     -0.0080     +0.0020     +0.0042
-colon                            0    0.6992     +0.0017     -0.0005     +0.0028     +0.0053
-stomach                          0    0.7026     -0.0067     -0.0078     +0.0011     +0.0008
+organ                           wt   l1_only  capacity_o      l1_adv  l1_adv_org  l1_adv_org  l1_adv_org  l1_adv_org  l1_bowel_z  l1_organ_c  l1_organ_c  l1_organ_c  l1_organ_c  pix2pixhd_     width32     width96
+aorta                            6    0.8550     -0.0795     -0.0311     -0.0135     -0.0016     -0.0018     -0.0023     -0.0012     +0.0070     +0.0098     +0.0119     +0.0063     -0.0207     -0.0033     +0.0138
+inferior_vena_cava               6    0.7705     -0.0510     -0.0302     -0.0287     -0.0081     -0.0029     -0.0097     +0.0003     -0.0000     +0.0032     +0.0018     +0.0026     -0.0308     -0.0058     +0.0037
+portal_vein_and_splenic_vein     6    0.7232     -0.0557     +0.0054     +0.0026     +0.0198     +0.0199     +0.0220     -0.0008     +0.0020     +0.0117     +0.0113     +0.0072     -0.0057     -0.0028     +0.0169
+heart                            4    0.7030     -0.0505     -0.0202     -0.0292     -0.0091     -0.0064     -0.0208     -0.0051     -0.0150     -0.0105     -0.0026     -0.0010     -0.0236     -0.0235     -0.0186
+liver                            3    0.8362     -0.0778     -0.0217     -0.0222     -0.0141     -0.0139     -0.0145     +0.0005     +0.0009     +0.0016     -0.0009     -0.0007     -0.0243     -0.0036     +0.0011
+pancreas                         2    0.7708     -0.0501     -0.0255     -0.0350     -0.0129     -0.0154     -0.0211     +0.0024     -0.0105     -0.0032     -0.0091     -0.0050     -0.0266     -0.0030     -0.0071
+pulmonary_vein                   4    0.7375     -0.0365     -0.0082     -0.0210     +0.0039     -0.0050     +0.0052     -0.0138     +0.0018     -0.0034     +0.0006     -0.0188     -0.0064     -0.0197     -0.0179
+small_bowel                      0    0.6182     -0.0220     -0.0071     -0.0080     -0.0084     -0.0099     -0.0090     +0.0020     +0.0042     +0.0035     +0.0023     +0.0029     -0.0067     -0.0007     +0.0026
+colon                            0    0.6992     -0.0185     +0.0017     -0.0005     +0.0029     +0.0005     +0.0022     +0.0028     +0.0053     +0.0025     +0.0037     +0.0038     +0.0027     +0.0022     +0.0045
+stomach                          0    0.7026     -0.0303     -0.0067     -0.0078     -0.0068     -0.0106     -0.0080     +0.0011     +0.0008     -0.0014     +0.0027     +0.0017     -0.0084     -0.0023     +0.0001
 
   Values are DELTAS vs baseline. Check them against per-organ jitter:
     aorta                            within-run std 0.0045

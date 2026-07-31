@@ -47,6 +47,30 @@ FILE_TAG     = '_deeds'           # suffix before .nii.gz (same as autoenc_fresh
 SEG_SUFFIX   = '_seg_full'
 TARGET_PHASE = 'venous'           # 'arterial' | 'venous' | 'portal' | 'delayed'
 
+# Phases to synthesise. TARGET_PHASE stays the single-phase default; listing more
+# than one trains ONE model on all of them, adding a (NCCT, target) pair per phase
+# per case. The first entry decides case membership, so the train/val/test split
+# is unchanged from a TARGET_PHASE-only run — that is what keeps multi-phase runs
+# comparable to everything already in analysis/.
+#
+# Why this exists: absolute enhancement depends on injection dose and bolus
+# timing, none of which is visible in an NCCT, so an unconditioned model can only
+# predict the average. Arterial and venous share the SAME NCCT input but have
+# different targets, which is a known, controlled instance of exactly that
+# ambiguity — training with and without USE_PHASE_COND measures what an explicit
+# conditioning variable recovers. See PROJECT_PLAN.md 1.9.
+TARGET_PHASES = [TARGET_PHASE]
+
+# FiLM-condition the DECODER on the target phase; the encoder stays
+# phase-agnostic and learns anatomy from every phase's pairs. Off => no
+# conditioning module is built at all, so parameters and RNG draws are identical
+# to a model compiled without the feature.
+USE_PHASE_COND = False
+PHASE_COND_DIM = 64
+# Generator input channels. 1 today; set to 2k+1 to feed a stack of adjacent
+# axial slices ("2.5-D") and predict the centre slice.
+IN_CHANNELS    = 1
+
 # ── HU normalisation ──────────────────────────────────────────────────────────
 # Data-driven via analyze_hu_range.py, but NOT its raw p0.5-p99.5 output
 # ([-900, 690]) — that pooled percentile is dominated by a huge low-density
@@ -443,6 +467,10 @@ train_config: dict = dict(
     file_tag             = FILE_TAG,
     seg_suffix           = SEG_SUFFIX,
     target_phase         = TARGET_PHASE,
+    target_phases        = TARGET_PHASES,
+    use_phase_cond       = USE_PHASE_COND,
+    phase_cond_dim       = PHASE_COND_DIM,
+    in_channels          = IN_CHANNELS,
     # HU normalisation
     hu_min               = HU_MIN,
     hu_max               = HU_MAX,

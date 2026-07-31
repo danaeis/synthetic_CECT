@@ -80,6 +80,32 @@ SCENARIOS=(
   # output pixel (r50 14 px -> 4 px moving to group). See
   # analysis/texture_consistency_findings.md.
   "l1_organ_groupnorm|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --generator_norm group"
+
+  # ── Phase conditioning: a 3-arm design ────────────────────────────────────
+  # Why. Four measurements have ruled out overfitting, registration error, voxel
+  # scale and capacity as the cause of the ~8 HU per-organ floor, leaving the
+  # aleatoric explanation: enhancement level depends on injection dose and bolus
+  # timing, which an NCCT cannot show. Arterial and venous share the SAME NCCT
+  # input but have different targets — a known, controlled instance of exactly
+  # that ambiguity. These two arms measure what an explicit conditioning
+  # variable recovers.
+  #
+  #   M1  venous-only            = l1_organ_curriculum_s{42,43,44}, already run
+  #   M2  multi-phase, NO input  <- below
+  #   M3  multi-phase + FiLM     <- below
+  #
+  # M2 IS NOT OPTIONAL. Without it an M3 gain cannot be attributed to
+  # conditioning rather than to 2x the pairs. It also has its own prediction: if
+  # the aleatoric story holds, M2 should be WORSE than M1 on venous featHU,
+  # because pooling two phases without saying which one adds ambiguity.
+  #
+  # NOTE both change the patch-cache key (the pair list gains arterial targets),
+  # so the first to run pays a one-time full re-preload. Expected, not a hang.
+  #
+  # Run M2 and M3 at seed 42 first; expand to 43/44 only if the featHU gap
+  # exceeds the measured 2-sigma gate of 0.82 HU.
+  "multiphase_uncond|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --target_phases venous arterial"
+  "multiphase_film|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --target_phases venous arterial --use_phase_cond"
   # add more scenarios here, format: "name|--flag1 --flag2 ..."
 )
 

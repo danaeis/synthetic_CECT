@@ -98,12 +98,20 @@ def main():
     ap.add_argument('--manifest', type=Path, required=True)
     ap.add_argument('--report', type=Path, required=True,
                     help='phase_eval_report.json for the same run')
+    # parent.parent: this file lives in scripts/, the label map is at the repo
+    # root under orgFeatXGB_CTPhase/. Keep the two in step if either moves.
     ap.add_argument('--label_map', type=Path,
-                    default=Path(__file__).resolve().parent /
+                    default=Path(__file__).resolve().parent.parent /
                             'orgFeatXGB_CTPhase' / 'retrain_out_full' /
                             'ts_label_map_total.json')
     ap.add_argument('--out', type=Path, default=None)
     args = ap.parse_args()
+
+    if not args.label_map.exists():
+        raise SystemExit(
+            f"label map not found: {args.label_map}\n"
+            f"Expected it at <repo>/orgFeatXGB_CTPhase/retrain_out_full/"
+            f"ts_label_map_total.json, or pass --label_map explicitly.")
 
     name_to_id = json.loads(args.label_map.read_text())
     bone_ids = _label_ids(name_to_id, BONE_PREFIXES)

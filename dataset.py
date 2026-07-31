@@ -81,13 +81,31 @@ def find_pairs_and_split(
 ) -> Tuple[List[Dict], List[Dict], List[Dict]]:
     """
     Scan data_dir, match NCCT + target-phase volumes in each case directory,
-    then split cases into train / val / test.
+    then split CASES into train / val / test.
 
     Returns (train_pairs, val_pairs, test_pairs)
-    Each pair is a dict: {'source_path', 'target_path', 'case_id'}
+    Each pair is {'source_path', 'target_path', 'seg_path', 'case_id',
+                  'phase', 'phase_id'}
+
+    Multi-phase (`cfg['target_phases'] = ['venous', 'arterial']`) emits one pair
+    per (case, available phase). Two properties this function must guarantee:
+
+      * NO PATIENT LEAKAGE. The split is over cases, and every phase of a case
+        lands in the same split. Splitting the expanded pair list instead would
+        put a patient's arterial scan in train and their venous in test.
+      * The single-phase split is UNCHANGED. The case list is built from cases
+        having NCCT + phases[0] and permuted exactly as before, so a run with
+        `target_phases=['venous']` reproduces the existing 97/20/20 split
+        case-for-case. That is what keeps multi-phase runs comparable to every
+        result already in analysis/.
     """
     data_dir     = Path(cfg['data_dir'])
-    target_phase = cfg.get('target_phase', 'venous')
+    # 'target_phases' (list) generalises 'target_phase' (scalar); the scalar is
+    # still what config.py and every existing run_config.json set.
+    target_phases = cfg.get('target_phases') or [cfg.get('target_phase', 'venous')]
+    if isinstance(target_phases, str):
+        target_phases = [target_phases]
+    target_phase = target_phases[0]
     file_tag     = cfg.get('file_tag', '_deeds')
     seg_suffix   = cfg.get('seg_suffix', '_seg_reg')   # e.g. '_seg_full' for the
                                                         # regenerated full TS masks
@@ -131,18 +149,29 @@ def find_pairs_and_split(
 
             vols[phase] = str(f)
 
+        # Case membership is decided by phases[0] alone, so adding a second phase
+        # never changes which cases exist or in what order — only how many pairs
+        # each case contributes.
         if 'non-contrast' in vols and target_phase in vols:
-            target_path = vols[target_phase]
-            # Organ/vessel segmentation mask for target_path (same grid).
-            # '..._deeds.nii.gz' -> '..._deeds{seg_suffix}.nii.gz' — use
-            # '_seg_full' for the regenerated full TS masks (incl. aorta/heart/IVC).
-            seg_path = target_path.replace(f'{file_tag}.nii.gz', f'{file_tag}{seg_suffix}.nii.gz')
-            pairs.append({
-                'source_path': vols['non-contrast'],
-                'target_path': target_path,
-                'seg_path':    seg_path if Path(seg_path).exists() else None,
-                'case_id':     case_id,
-            })
+            case_pairs = []
+            for pid, ph in enumerate(target_phases):
+                if ph not in vols:
+                    continue                     # e.g. the one case with no arterial
+                target_path = vols[ph]
+                # Organ/vessel segmentation mask for target_path (same grid).
+                # '..._deeds.nii.gz' -> '..._deeds{seg_suffix}.nii.gz' — use
+                # '_seg_full' for the regenerated full TS masks (aorta/heart/IVC).
+                seg_path = target_path.replace(f'{file_tag}.nii.gz',
+                                               f'{file_tag}{seg_suffix}.nii.gz')
+                case_pairs.append({
+                    'source_path': vols['non-contrast'],
+                    'target_path': target_path,
+                    'seg_path':    seg_path if Path(seg_path).exists() else None,
+                    'case_id':     case_id,
+                    'phase':       ph,
+                    'phase_id':    pid,
+                })
+            pairs.append(case_pairs)             # grouped by case, flattened below
 
     if not pairs:
         log.error(
@@ -153,19 +182,29 @@ def find_pairs_and_split(
         )
         return [], [], []
 
-    log.info(f"Found {len(pairs)} valid NCCT/{target_phase} pairs")
+    n_pairs = sum(len(cp) for cp in pairs)
+    log.info(f"Found {len(pairs)} cases with NCCT/{target_phase}"
+             + (f" — {n_pairs} pairs over phases {target_phases}"
+                if len(target_phases) > 1 else f" ({n_pairs} pairs)"))
 
-    # Case-level split (identical to autoenc_fresh's split strategy)
+    # Case-level split. `pairs` is a list of PER-CASE lists, so permuting it
+    # keeps every phase of a case together — the leakage guarantee. Split sizes
+    # are computed on the CASE count, and with one phase that is the pair count,
+    # so the single-phase split is bit-identical to before.
     n_test = max(1, int(len(pairs) * test_split))
     n_val  = max(1, int(len(pairs) * val_split))
     rng    = np.random.default_rng(seed)
     idx    = rng.permutation(len(pairs))
 
-    test_pairs  = [pairs[i] for i in idx[:n_test]]
-    val_pairs   = [pairs[i] for i in idx[n_test: n_test + n_val]]
-    train_pairs = [pairs[i] for i in idx[n_test + n_val:]]
+    def _flat(sel):
+        return [p for i in sel for p in pairs[i]]
 
-    log.info(f"  train={len(train_pairs)}  val={len(val_pairs)}  test={len(test_pairs)}")
+    test_pairs  = _flat(idx[:n_test])
+    val_pairs   = _flat(idx[n_test: n_test + n_val])
+    train_pairs = _flat(idx[n_test + n_val:])
+
+    log.info(f"  cases  train={len(idx) - n_test - n_val}  val={n_val}  test={n_test}")
+    log.info(f"  pairs  train={len(train_pairs)}  val={len(val_pairs)}  test={len(test_pairs)}")
     return train_pairs, val_pairs, test_pairs
 
 
@@ -293,6 +332,10 @@ class CTPairDataset(Dataset):
             # provenance, rather than forcing a full re-preload.
             self.case_ids = list(data['case_id']) if 'case_id' in data else None
             self.patch_z  = list(data['patch_z'])  if 'patch_z'  in data else None
+            # Pre-multi-phase caches carry no phase; they are single-phase by
+            # construction, so phase 0 for every patch is the correct reading.
+            self.phase_ids = (list(data['phase_id']) if 'phase_id' in data
+                              else [0] * len(self.src_patches))
             if self.case_ids is None:
                 log.info(f"  [{split_name}] cache predates per-patch provenance — "
                          f"sample grids will be random but unlabelled "
@@ -322,12 +365,17 @@ class CTPairDataset(Dataset):
         # case it came from without widening the coord tuples (which are built in
         # two places: here and _organ_centred_coords).
         path_to_case: Dict[str, str] = {}
+        # Phase keys on the TARGET path, not the source: under multi-phase the
+        # same NCCT is the source for both the arterial and the venous pair, so
+        # src_path does not identify the phase.
+        path_to_phase: Dict[str, int] = {}
         for pair in pairs:
             src_path = pair['source_path']
             tgt_path = pair['target_path']
             seg_path = pair.get('seg_path')
             case_id  = pair['case_id']
             path_to_case[src_path] = case_id
+            path_to_phase[tgt_path] = int(pair.get('phase_id', 0))
             if self.load_mask and seg_path is None:
                 n_missing_seg += 1
             try:
@@ -393,6 +441,9 @@ class CTPairDataset(Dataset):
             self.src_patches: List[np.ndarray] = []
             self.tgt_patches: List[np.ndarray] = []
             self.mask_patches = [] if self.load_mask else None
+            self.case_ids = []
+            self.patch_z = []
+            self.phase_ids = []
             return
 
         # ── Step 2: sub-sample (mixing organ-focused + grid candidates) ───────
@@ -417,6 +468,7 @@ class CTPairDataset(Dataset):
         self.mask_patches = [] if self.load_mask else None
         self.case_ids     = []
         self.patch_z      = []
+        self.phase_ids    = []
 
         def _crop(vol, z, y, x):
             if self.patch_depth == 1:
@@ -443,6 +495,7 @@ class CTPairDataset(Dataset):
             self.tgt_patches.append(tp)
             self.case_ids.append(path_to_case.get(src_path, 'unknown'))
             self.patch_z.append(int(z))
+            self.phase_ids.append(path_to_phase.get(tgt_path, 0))
 
             if self.load_mask:
                 mp = np.zeros_like(sp)
@@ -468,7 +521,8 @@ class CTPairDataset(Dataset):
             self._cache_file.parent.mkdir(parents=True, exist_ok=True)
             save_kwargs = {'src': np.stack(self.src_patches), 'tgt': np.stack(self.tgt_patches),
                            'case_id': np.array(self.case_ids),   # plain unicode array, no pickle
-                           'patch_z': np.array(self.patch_z, dtype=np.int32)}
+                           'patch_z': np.array(self.patch_z, dtype=np.int32),
+                           'phase_id': np.array(self.phase_ids, dtype=np.int64)}
             if self.load_mask:
                 save_kwargs['mask'] = np.stack(self.mask_patches)
             np.savez(self._cache_file, **save_kwargs)
@@ -579,6 +633,11 @@ class CTPairDataset(Dataset):
             'mask_multilabel': self.mask_multilabel,
             'seg_suffix':   cfg.get('seg_suffix', '_seg_reg'),  # switching mask set changes cached masks
             'split_name':   self.split_name,
+            # The pair list already differs between single- and multi-phase runs
+            # (arterial targets are different files), so the digest would change
+            # anyway — this is explicit rather than incidental.
+            'target_phases': list(cfg.get('target_phases')
+                                  or [cfg.get('target_phase', 'venous')]),
         }
         # Only perturb the cache key when organ-focus is on, so existing
         # uniform-grid caches remain valid for legacy (frac==0) runs.
@@ -598,6 +657,11 @@ class CTPairDataset(Dataset):
         src = torch.from_numpy(self.src_patches[idx]).unsqueeze(0)  # (1, H, W) or (1, D, H, W)
         tgt = torch.from_numpy(self.tgt_patches[idx]).unsqueeze(0)
         item = {'source': src, 'target': tgt}
+        # Always emitted (0 for single-phase runs) so the batch schema does not
+        # change with the flag; the trainer only forwards it when the generator
+        # was built with use_phase_cond.
+        item['phase'] = torch.tensor(
+            self.phase_ids[idx] if self.phase_ids else 0, dtype=torch.long)
         if self.mask_patches:
             item['mask'] = torch.from_numpy(self.mask_patches[idx]).unsqueeze(0)
         return item
