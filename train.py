@@ -124,9 +124,17 @@ def _parse():
                         'The FIRST decides case membership, so the train/val/test '
                         'split matches a single-phase run on that phase.')
     p.add_argument('--phase_cond_dim', type=int, default=None,
-                   help='width of the phase embedding (default 64)')
-    p.add_argument('--in_channels', type=int, default=None,
-                   help='generator input channels; 2k+1 for a 2.5-D slice stack')
+                   help='width of the conditioning embedding (default 64)')
+    p.add_argument('--cond_organs', type=str, nargs='*', default=None,
+                   help='organs whose median HU conditions the decoder, e.g. '
+                        '--cond_organs aorta. Needs splits/levels.json from '
+                        'scripts/dump_levels.py. ORACLE information: evaluate with '
+                        'infer_volume.py --level_mode and report the oracle-minus-'
+                        'population gap, never oracle alone.')
+    p.add_argument('--n_input_slices', type=int, default=None,
+                   help='2.5-D: odd number of adjacent axial slices fed as channels '
+                        '(1=plain 2-D, 5=k2 gives 7.5mm of z, 11=k5 gives 16.5mm). '
+                        'Sets in_channels automatically.')
 
     p.add_argument('--perceptual_backbone', type=str, default=None, choices=['vgg', 'dino'])
     p.add_argument('--saliency_mode',       type=str, default=None, choices=['heuristic', 'dino'])
@@ -154,7 +162,8 @@ def _parse():
     for flag in ['adversarial', 'perceptual', 'feature_matching',
                  'ssim', 'gradient', 'frequency',
                  'organ', 'saliency', 'cycle', 'seg_consistency',
-                 'l1_decay', 'per_organ_weights', 'hu_profile', 'phase_cond']:
+                 'l1_decay', 'per_organ_weights', 'hu_profile', 'phase_cond',
+                 'cond_disc']:
         g = p.add_mutually_exclusive_group()
         g.add_argument(f'--use_{flag}',  dest=f'use_{flag}', action='store_true', default=None)
         g.add_argument(f'--no_{flag}',   dest=f'use_{flag}', action='store_false')
@@ -184,8 +193,13 @@ def _apply(cfg: dict, args) -> dict:
         # Keep the scalar in step: it is what the manifest, the phase evaluator
         # and every existing run_config.json read.
         c['target_phase'] = args.target_phases[0]
+    if args.n_input_slices is not None:
+        c['n_input_slices'] = args.n_input_slices
+        c['in_channels'] = args.n_input_slices     # derived, never set separately
+    if args.cond_organs is not None:
+        c['cond_organs'] = args.cond_organs
     for k in ['selection_metric', 'sample_mode', 'sample_n', 'max_train_cases',
-              'phase_cond_dim', 'in_channels',
+              'phase_cond_dim',
               'lambda_organ', 'lambda_hu_profile', 'lambda_l1_floor',
               'l1_decay_start_epoch', 'l1_decay_end_epoch',
               'adv_warmup_epochs', 'lr_disc', 'seed', 'data_seed']:
@@ -195,7 +209,8 @@ def _apply(cfg: dict, args) -> dict:
     for flag in ['adversarial', 'perceptual', 'feature_matching',
                  'ssim', 'gradient', 'frequency',
                  'organ', 'saliency', 'cycle', 'seg_consistency',
-                 'l1_decay', 'per_organ_weights', 'hu_profile', 'phase_cond']:
+                 'l1_decay', 'per_organ_weights', 'hu_profile', 'phase_cond',
+                 'cond_disc']:
         v = getattr(args, f'use_{flag}', None)
         if v is not None:
             c[f'use_{flag}'] = v

@@ -184,6 +184,7 @@ class UNetGenerator(nn.Module):
         use_phase_cond: bool = False,
         n_phases:      int = 2,
         cond_dim:      int = 64,
+        n_levels:      int = 0,
     ):
         super().__init__()
         self.dims = dims
@@ -191,6 +192,11 @@ class UNetGenerator(nn.Module):
         self.in_channels = in_channels
         self.use_phase_cond = use_phase_cond
         self.n_phases = n_phases
+        self.n_levels = n_levels
+        # Either source (or both) turns conditioning on. Phase is a CLASS id;
+        # level is a CONTINUOUS vector of standardised per-organ HU. They are
+        # summed into one embedding so downstream FiLM does not care which is on.
+        self.use_cond = bool(use_phase_cond or n_levels)
         ch  = base_channels
         bn  = ch * 8                   # bottleneck channels
 
@@ -244,8 +250,15 @@ class UNetGenerator(nn.Module):
         # the global RNG, so instantiating them unconditionally — even unused —
         # would shift the init of every layer created afterwards and silently
         # change baseline results under a fixed seed.
-        if use_phase_cond:
-            self.phase_emb = nn.Embedding(n_phases, cond_dim)
+        if self.use_cond:
+            if use_phase_cond:
+                self.phase_emb = nn.Embedding(n_phases, cond_dim)
+            if n_levels:
+                # Zero-init so that at step 0 the level contributes nothing and
+                # the model is still bitwise equal to the unconditioned one.
+                self.level_proj = nn.Linear(n_levels, cond_dim)
+                nn.init.zeros_(self.level_proj.weight)
+                nn.init.zeros_(self.level_proj.bias)
             self.film_bottleneck = FiLM(cond_dim, bn)
             self.film_dec4 = FiLM(cond_dim, ch * 4)
             self.film_dec3 = FiLM(cond_dim, ch * 2)
@@ -256,6 +269,7 @@ class UNetGenerator(nn.Module):
         log.info(f"UNetGenerator | dims={dims} | in_ch={in_channels} | "
                  f"base_ch={base_channels} | pool_stride={stride} | norm={norm}"
                  + (f" | phase_cond({n_phases})" if use_phase_cond else "")
+                 + (f" | level_cond({n_levels})" if n_levels else "")
                  + f" | {n:.2f}M params")
 
     def film_stats(self) -> dict:
@@ -264,11 +278,17 @@ class UNetGenerator(nn.Module):
         gamma converging to ~0 means the decoder ignored the phase input, which
         is a result in its own right: conditioning bought nothing.
         """
-        if not self.use_phase_cond:
+        if not self.use_cond:
             return {}
         with torch.no_grad():
-            cond = self.phase_emb(torch.arange(self.n_phases,
-                                               device=self.phase_emb.weight.device))
+            if self.use_phase_cond:
+                cond = self.phase_emb(torch.arange(
+                    self.n_phases, device=self.phase_emb.weight.device))
+            else:
+                # Level-only: probe with a unit vector per level channel, so the
+                # reported |gamma| reflects sensitivity to the level input.
+                cond = self.level_proj(torch.eye(
+                    self.n_levels, device=self.level_proj.weight.device))
             out = {}
             for name in ('bottleneck', 'dec4', 'dec3', 'dec2', 'dec1'):
                 film = getattr(self, f'film_{name}')
@@ -276,8 +296,36 @@ class UNetGenerator(nn.Module):
                 out[f'gamma_{name}'] = float(gamma.abs().mean())
         return out
 
+    def cond_vec(self, phase: Optional[torch.Tensor] = None,
+                 level: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
+        """Build the conditioning embedding from whichever sources are active.
+
+        Public because the DISCRIMINATOR needs the identical vector — a D that
+        cannot see the conditioning will penalise a correct arterial output for
+        not looking venous.
+        """
+        if not self.use_cond:
+            if phase is not None or level is not None:
+                raise ValueError(
+                    "conditioning was given but the model was built without it — "
+                    "it would be silently ignored. Set use_phase_cond / n_levels.")
+            return None
+        c = None
+        if self.use_phase_cond:
+            if phase is None:
+                raise ValueError("use_phase_cond=True requires a `phase` tensor (B,)")
+            c = self.phase_emb(phase.reshape(-1).long())
+        if self.n_levels:
+            if level is None:
+                raise ValueError(f"n_levels={self.n_levels} requires a `level` "
+                                 f"tensor (B, {self.n_levels})")
+            lp = self.level_proj(level.float())
+            c = lp if c is None else c + lp
+        return c
+
     def forward(self, x: torch.Tensor,
-                phase: Optional[torch.Tensor] = None) -> torch.Tensor:
+                phase: Optional[torch.Tensor] = None,
+                level: Optional[torch.Tensor] = None) -> torch.Tensor:
         # Encoder is deliberately NOT conditioned: it sees every phase's pairs
         # and learns phase-agnostic anatomy.
         e1 = self.enc1(x)
@@ -287,20 +335,18 @@ class UNetGenerator(nn.Module):
 
         b  = self.bottleneck(self.pool(e4))
 
-        if not self.use_phase_cond:
-            if phase is not None:
+        if not self.use_cond:
+            if phase is not None or level is not None:
                 raise ValueError(
-                    "phase was given but use_phase_cond=False — the model would "
-                    "silently ignore it. Build with use_phase_cond=True.")
+                    "conditioning was given but the model was built without it — "
+                    "it would be silently ignored.")
             d  = self.up4(b);  d = self.dec4(torch.cat([d, e4], dim=1))
             d  = self.up3(d);  d = self.dec3(torch.cat([d, e3], dim=1))
             d  = self.up2(d);  d = self.dec2(torch.cat([d, e2], dim=1))
             d  = self.up1(d);  d = self.dec1(torch.cat([d, e1], dim=1))
             return self.out_conv(d)
 
-        if phase is None:
-            raise ValueError("use_phase_cond=True requires a `phase` tensor (B,)")
-        c = self.phase_emb(phase.reshape(-1).long())
+        c = self.cond_vec(phase, level)
 
         b  = self.film_bottleneck(b, c)
         d  = self.up4(b);  d = self.film_dec4(self.dec4(torch.cat([d, e4], dim=1)), c)
@@ -329,14 +375,27 @@ class PatchGANDiscriminator(nn.Module):
                       (1,2,2) keeps depth, (2,2,2) downsamples all.
                       Default (1,2,2) — safe for patch_depth 8–16.
 
+        in_channels:  1 = unconditional (a pure texture critic). Set to 2 and
+                      feed cat([source, image]) for the real pix2pix D(x, y),
+                      which judges whether the pair is consistent rather than
+                      whether the image alone looks real.
+        cond_dim:     If set, a conditioning vector is projected and added to an
+                      intermediate feature map (projection-discriminator style).
+                      Required once the GENERATOR is conditioned: a D that has
+                      only learned venous statistics will otherwise penalise a
+                      correct arterial output and fight the conditioning.
+
     Input shapes:
-        dims=2: (B, 1, H, W)
-        dims=3: (B, 1, D, H, W)
+        dims=2: (B, in_channels, H, W)
+        dims=3: (B, in_channels, D, H, W)
     """
 
-    def __init__(self, dims: int = 2, ndf: int = 64, n_layers: int = 4, stride_3d=None):
+    def __init__(self, dims: int = 2, ndf: int = 64, n_layers: int = 4, stride_3d=None,
+                 in_channels: int = 1, cond_dim: int = 0):
         super().__init__()
         self.dims = dims
+        self.in_channels = in_channels
+        self.cond_dim = cond_dim
         Conv = _conv(dims)
         BN   = _bnorm(dims)
 
@@ -352,7 +411,7 @@ class PatchGANDiscriminator(nn.Module):
 
         # Block 0 — no norm
         self.blocks.append(nn.Sequential(
-            Conv(1, ndf, 4, stride=s, padding=1),
+            Conv(in_channels, ndf, 4, stride=s, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
         ))
 
@@ -374,6 +433,13 @@ class PatchGANDiscriminator(nn.Module):
 
         self.output_conv = Conv(nf, 1, 4, stride=s1, padding=1)
 
+        # Built strictly inside the `if`, same RNG-draw reason as the generator's
+        # FiLM: constructing an unused module would shift every later init.
+        if cond_dim:
+            self.cond_proj = nn.Linear(cond_dim, nf)
+            nn.init.zeros_(self.cond_proj.weight)
+            nn.init.zeros_(self.cond_proj.bias)
+
         n = sum(p.numel() for p in self.parameters()) / 1e6
         log.info(f"PatchGANDiscriminator | dims={dims} | ndf={ndf} | "
                  f"stride={s} | {n:.2f}M params")
@@ -382,12 +448,25 @@ class PatchGANDiscriminator(nn.Module):
         self,
         x: torch.Tensor,
         return_features: bool = False,
+        cond: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]]]:
         features: List[torch.Tensor] = []
         h = x
         for block in self.blocks:
             h = block(h)
             features.append(h)
+        if self.cond_dim:
+            if cond is None:
+                raise ValueError("discriminator was built with cond_dim>0 but no "
+                                 "`cond` was passed")
+            # Projection conditioning: add a per-channel bias derived from the
+            # conditioning vector to the deepest feature map. Rank-agnostic
+            # broadcast, same reason as FiLM.
+            proj = self.cond_proj(cond)
+            h = h + proj.view(h.shape[0], -1, *([1] * (h.ndim - 2)))
+        elif cond is not None:
+            raise ValueError("`cond` was given but the discriminator is "
+                             "unconditional (cond_dim=0)")
         logits = self.output_conv(h)
 
         if return_features:

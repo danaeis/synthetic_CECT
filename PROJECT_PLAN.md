@@ -299,6 +299,92 @@ C1 is the one to do first. If it lands, the thesis contribution becomes
 stronger and more novel claim than another loss ablation — and the design doc for
 it already exists on the `archive/phase-conditioning` branch.
 
+### GroupNorm is confirmed on featHU — and half the prediction failed
+
+Benchmarked at 3 seeds against `l1_organ_curriculum_s{42,43,44}`:
+
+| metric | curriculum | groupnorm | 2σ gate | Δ | verdict |
+|---|---|---|---|---|---|
+| **feature_l1_hu** | 14.501 | **13.461** | 0.838 | **−1.040** | **REAL** (1.24× gate) |
+| org_mae | 0.0298 | **0.0287** | 0.0002 | −0.0011 | REAL |
+| org_ssim | 0.9683 | **0.9698** | 0.0002 | +0.0015 | REAL |
+| psnr | 30.374 | **30.632** | 0.087 | +0.258 | REAL |
+| zflicker | 0.9080 | **0.8944** | 0.0033 | −0.0136 | REAL |
+| **seam** | 1.3461 | **1.3541** | 0.0077 | **+0.0080** | **REAL — but WORSE** |
+
+−1.04 HU featHU at 3 seeds is the **largest validated single-flag win in the
+project**, and it comes from one config change.
+
+**But the seam got slightly worse, which was not the prediction.** GroupNorm was
+proposed to fix two symptoms of one cause; it fixed the HU one and missed the
+tiling one. The reason was already visible in `scripts/erf.py`: group norm's
+gradient support is **128 = patch/2 — still unbounded**, exactly like instance
+norm. Only batch norm was bounded at 94 px. `norm_attribution.py` (drift 13.98 →
+6.83 HU) and the ERF measurement disagreed about group norm, and **the ERF
+measurement was right about the seam.**
+
+Worth reporting honestly: a mechanistic prediction that was half right, with the
+measurement that would have called it. It also names the next experiment — if the
+seam matters, `--generator_norm batch` is the only option the ERF says is
+tile-invariant by construction.
+
+Two other results from the same table:
+
+- **`l1_huprofile_only` featHU 18.31** vs 14.50 — the HU-profile loss made things
+  substantially *worse*. Still confounded (`organ_focus_frac=0.0`), so re-run
+  before concluding; but this is what the aleatoric hypothesis predicts, since
+  forcing a model to match an unpredictable level on the training set is fitting
+  noise.
+- **`memorize97` featHU 16.32** vs 14.50 — despite reaching a *lower* train error
+  (5.18 vs 8.32 HU). Extra fitting capacity spent on case-specific information
+  that does not generalise. Direct corroboration of §1.9.
+
+### Gate C-ter — level conditioning + conditional D (implemented 2026-07-31)
+
+`scripts/audit_enhancement.py` ran and the aleatoric hypothesis is **supported**,
+identically across two differently-trained models (aorta β 0.235 vs 0.234):
+
+| statistic | value | reading |
+|---|---|---|
+| median β, contrast organs | **0.181** | recovers only 18% of level variation |
+| median var(gen)/var(real) | **0.176** | output is 5.7× under-dispersed |
+| featHU vs real aorta HU | **r = +0.765** | 59% of per-case error is the level miss |
+
+Negative controls behave: gallbladder (r=+0.242) and colon (r=+0.127), which barely
+enhance, show nothing. This is a property of the **task**, not the loss.
+
+**Implemented, ready to run:**
+
+| arm | scenario | conditioning | held-out organs |
+|---|---|---|---|
+| **B0** | `b0_groupnorm_adv` | none — the texture baseline | 16 |
+| **L1** | `level_aorta` | aorta (1 scalar) | 15 |
+| **L2** | `level_aorta_pv` | aorta + PV (2) | 14 |
+| **L3** | `level_all8` | all 8 audited organs | 8 |
+
+```bash
+python scripts/dump_levels.py                     # -> splits/levels.json (ORACLE)
+python scripts/probe_level_predictability.py      # is the level in the NCCT at all?
+./run_scenarios.sh b0_groupnorm_adv level_aorta level_aorta_pv level_all8
+```
+
+Evaluate each arm **twice** — `--level_mode oracle` and `--level_mode population` —
+and report the **gap**. Oracle reads the answer off the real CECT and is never a
+headline number. Then `scripts/heldout_feathu.py` for the non-circular featHU.
+
+If L1 alone recovers most of the error, contrast level is a **single global latent
+factor**. If recovery grows with each scalar, each organ carries independent
+unpredictable variation. Either is a result.
+
+**The adversarial loss is back on, with a conditional D.** The seed-42 table shows
+adversarial is 2.1× better on `gradW1`, 2.4× on `oGradW1` and 1.7× closer to 1.0 on
+`raps_hf`, for +0.30 HU featHU — **inside the 0.82 HU 2σ gate**, i.e. free. And the
+two interventions are complementary rather than competing: L1 regression to the
+conditional median causes **both** blur and level under-dispersion, and adversarial
+fixes only the first (aorta var ratio 0.12 for both `l1_organ_curriculum` and
+`l1_adv_organ`). D is now conditional — `cat([source, image])` plus the same
+conditioning vector G sees — which also addresses the old instability.
+
 ### Gate D — Z context, the one architectural gap left standing
 
 §1.5 rules out in-plane FOV and resampling. Z is the only geometric deficiency
@@ -307,9 +393,14 @@ that survived measurement.
 **2.5-D input**: feed `2k+1` adjacent axial slices as input channels, predict the
 centre slice. Stays a 2-D network; near-zero extra parameters.
 
-Required first: an `in_channels` argument on `UNetGenerator` (hardcoded to 1 at
-[models.py:154](models.py#L154)), a depth-crop in `dataset.py`, and asymmetric
-in/out depth in `infer_volume.py`. Sweep k=2 (7.5 mm) vs k=5 (16.5 mm).
+**Implemented 2026-07-31.** `N_INPUT_SLICES` (odd) drives everything; the z window
+is edge-clamped so no slices are lost and training matches inference at volume
+boundaries.
+
+```bash
+./run_scenarios.sh slices5_k2 slices11_k5     # k=2 (7.5mm), k=5 (16.5mm)
+```
+Both change the patch-cache key → one full re-preload each.
 
 Full 3-D only if 2.5-D moves vessel HU. It is more tractable than previously
 assumed, since §1.5 shows the data is already isotropic.

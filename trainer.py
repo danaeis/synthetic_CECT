@@ -162,11 +162,21 @@ class Trainer:
             use_phase_cond= config.get('use_phase_cond', False),
             n_phases      = max(2, len(_phases)),
             cond_dim      = config.get('phase_cond_dim', 64),
+            n_levels      = len(config.get('cond_organs') or []),
         ).to(self.device)
 
         self.use_adv = config.get('use_adversarial', True)
         if self.use_adv:
-            self.D = PatchGANDiscriminator(dims=dims, ndf=64).to(self.device)
+            # Conditional D (pix2pix's D(x, y)) sees cat([source, image]), so its
+            # first conv takes 2 channels — or 1 + n_input_slices under 2.5-D,
+            # where `source` is a slice stack.
+            cond_d = config.get('use_cond_disc', False)
+            d_in = (1 + int(config.get('in_channels', 1))) if cond_d else 1
+            self.D = PatchGANDiscriminator(
+                dims=dims, ndf=64, in_channels=d_in,
+                cond_dim=(config.get('phase_cond_dim', 64)
+                          if (cond_d and self.G.use_cond) else 0),
+            ).to(self.device)
         else:
             self.D = None
 
@@ -269,12 +279,22 @@ class Trainer:
                  f"patch_size={self.cfg.get('patch_size')}")
 
     # -----------------------------------------------------------------------
-    def _disc_step(self, real, fake):
-        """Train discriminator one step. Returns (loss_val, real_features)."""
+    def _disc_step(self, real, fake, source=None, cond=None):
+        """Train discriminator one step. Returns (loss_val, real_features).
+
+        With a conditional D the input is cat([source, image]) — pix2pix's
+        D(x, y), which judges whether the PAIR is consistent rather than whether
+        the image alone looks real. `cond` carries the same phase/level vector the
+        generator saw; without it a D trained mostly on venous data would penalise
+        a correct arterial output.
+        """
         self.opt_D.zero_grad()
+        kw = {'cond': cond} if cond is not None else {}
         with autocast('cuda', enabled=self.use_amp):
-            logits_real, real_feats = self.D(real,          return_features=True)
-            logits_fake, _          = self.D(fake.detach(), return_features=False)
+            logits_real, real_feats = self.D(self._d_in(real, source),
+                                             return_features=True, **kw)
+            logits_fake, _          = self.D(self._d_in(fake.detach(), source),
+                                             return_features=False, **kw)
             loss_D = self.criterion.adv_loss.disc_loss(logits_real, logits_fake)
         self.scaler_D.scale(loss_D).backward()
         self.scaler_D.unscale_(self.opt_D)
@@ -284,6 +304,38 @@ class Trainer:
         return loss_D.item(), real_feats
 
     # -----------------------------------------------------------------------
+    def _d_in(self, img, source):
+        """Discriminator input: cat([source, img]) when D is conditional."""
+        if getattr(self.D, 'in_channels', 1) > 1 and source is not None:
+            return torch.cat([source, img], dim=1)
+        return img
+
+    def _cond_for_d(self, phase, level):
+        """Conditioning vector for the DISCRIMINATOR — always DETACHED.
+
+        It is produced by the generator's embedding, so it must be cut from that
+        graph for two independent reasons:
+
+          * the D step calls backward() before the G step does, which would free
+            the shared graph and make the G backward fail outright;
+          * D is a critic. Letting its gradients reach G's conditioning embedding
+            would let G reduce the adversarial loss by reshaping what it *claims*
+            was requested instead of by improving the image.
+        """
+        if not getattr(self.G, 'use_cond', False):
+            return None
+        return self.G.cond_vec(phase, level).detach()
+
+    def _level(self, batch: Dict):
+        """Level vector for this batch, or None when the generator has none."""
+        if not getattr(self.G, 'n_levels', 0):
+            return None
+        lv = batch.get('level')
+        if lv is None:
+            raise KeyError("generator has n_levels>0 but the batch has no 'level' "
+                           "key — stale patch cache? delete it and re-preload")
+        return lv.to(self.device)
+
     def _phase(self, batch: Dict):
         """Phase ids for this batch, or None when the generator is unconditioned.
 
@@ -304,33 +356,39 @@ class Trainer:
         target = batch['target'].to(self.device)
         mask   = batch['mask'].to(self.device) if 'mask' in batch else None
         phase  = self._phase(batch)
+        level  = self._level(batch)
+        dcond  = (self._cond_for_d(phase, level)
+                  if getattr(self.D, 'cond_dim', 0) else None)
 
         # Generator forward for the discriminator's fake input only — no_grad
         # because it is immediately detached; avoids building an autograd
         # graph that would just be discarded (halves G forward-passes/step).
         if self.D is not None and (self.global_step % self.disc_freq == 0):
             with torch.no_grad(), autocast('cuda', enabled=self.use_amp):
-                fake_for_d = self.G(source, phase)
-            loss_D_val, real_feats = self._disc_step(target, fake_for_d)
+                fake_for_d = self.G(source, phase, level)
+            loss_D_val, real_feats = self._disc_step(target, fake_for_d,
+                                                     source=source, cond=dcond)
         else:
             loss_D_val, real_feats = 0.0, None
 
         # Generator step (re-forward so gradients flow)
         self.opt_G.zero_grad()
         with autocast('cuda', enabled=self.use_amp):
-            fake = self.G(source, phase)
+            fake = self.G(source, phase, level)
 
             adv_logits = None
             fake_feats = None
             if self.D is not None:
-                adv_logits, fake_feats = self.D(fake, return_features=True)
+                adv_logits, fake_feats = self.D(
+                    self._d_in(fake, source), return_features=True,
+                    **({'cond': dcond} if dcond is not None else {}))
 
             cycle_pred = None
             if self.use_cycle:
                 # G(G(source)): the intermediate is a synthetic CECT, so its
                 # "phase" is ill-defined. Reusing the target phase is a
                 # convention, not a derivation — use_cycle is off by default.
-                cycle_pred = self.G(fake, phase)     # fake → G → should ≈ source
+                cycle_pred = self.G(fake, phase, level)   # fake → G → ≈ source
 
             loss_G, ld = self.criterion(
                 pred            = fake,
@@ -384,7 +442,7 @@ class Trainer:
             tgt = batch['target'].to(self.device)
             mask = batch.get('mask')
             with autocast('cuda', enabled=self.use_amp):
-                fake = self.G(src, self._phase(batch))
+                fake = self.G(src, self._phase(batch), self._level(batch))
             for i in range(src.size(0)):
                 p = _center_flat(fake[i]).astype(np.float64)
                 t = _center_flat(tgt[i]).astype(np.float64)
@@ -492,7 +550,7 @@ class Trainer:
             batch = torch.utils.data.default_collate([ds[i] for i in idx])
             src = batch['source'].to(self.device)
             tgt = batch['target'].to(self.device)
-            fake = self.G(src, self._phase(batch))
+            fake = self.G(src, self._phase(batch), self._level(batch))
 
         n = src.size(0)
         case_ids = getattr(ds, 'case_ids', None)

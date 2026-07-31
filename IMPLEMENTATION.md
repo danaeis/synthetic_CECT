@@ -72,10 +72,19 @@ Three phases in `__init__`:
 `load_mask = use_organ or use_seg_consistency` — segmentation volumes are only read
 when one of those is on.
 
+**2.5-D** (`n_input_slices = 2k+1`): the source crop becomes `(2k+1, H, W)` while
+the target stays the centre slice — the one place in this file where source and
+target shapes differ. The z window is **edge-clamped**
+(`np.clip(arange(z-k, z+k+1), 0, D-1)`), not shrunk: inference must emit slice 0
+and D-1 regardless, so clamping is required there, and using the same rule in
+training avoids a boundary train/test mismatch. No slices are lost.
+
 `__getitem__` is a pure array lookup returning `{'source', 'target', 'phase'}`
-(+ `'mask'` if masks were loaded). `phase` is always present — 0 for single-phase
-runs — so the batch schema does not change with the flag; the trainer forwards it
-only when the generator was built with `use_phase_cond`. **No augmentation of any
+(+ `'mask'` if masks were loaded, + `'level'` when `cond_organs` is set). `phase` is
+always present — 0 for single-phase runs — so the batch schema does not change with
+the flag; the trainer forwards it only when the generator was built with
+`use_phase_cond`. Under 2.5-D the source is already `(2k+1, H, W)`, so the channel
+axis is **not** added again. **No augmentation of any
 kind exists.**
 
 ⚠ **Silent failure modes.** If a mask's shape does not match its volume, that
@@ -93,8 +102,8 @@ Raising it changes the cache key.
 ### On-disk patch cache
 `_cache_path` md5-hashes everything determining content: the sorted pair list,
 patch geometry, validity thresholds, `hu_min/hu_max`, `max_patches`, `data_seed`,
-`load_mask`, `mask_multilabel`, `seg_suffix`, `split_name`, `target_phases`, and
-the organ-focus knobs when `frac > 0`. Located under `cfg['cache_dir']`, **independent of
+`load_mask`, `mask_multilabel`, `seg_suffix`, `split_name`, `target_phases`,
+`n_input_slices`, `cond_organs`, and the organ-focus knobs when `frac > 0`. Located under `cfg['cache_dir']`, **independent of
 `output_dir`**, so scenarios differing only in loss flags share one cache. Organ
 weight *values* are deliberately excluded — they apply in the loss, so re-tuning
 must not force a re-preload.
@@ -130,6 +139,7 @@ wasted its negative half and saturated near the targets).
 
 `in_channels` defaults to 1; set it to `2k+1` to feed a stack of adjacent axial
 slices ("2.5-D") and predict the centre slice. The output stays 1 channel.
+Driven by `N_INPUT_SLICES` (must be odd) — see §1.
 
 ### Phase conditioning (FiLM) — `use_phase_cond`, off by default
 `forward(x, phase=None)`. When enabled, a `nn.Embedding(n_phases, cond_dim)` drives
@@ -155,6 +165,47 @@ Two invariants, both asserted in `tests/test_phase_cond.py`:
 
 Passing `phase` to an unconditioned model (or omitting it for a conditioned one)
 raises rather than being silently ignored.
+
+### Level conditioning — `cond_organs`, off by default
+A second, **continuous** conditioning source: `nn.Linear(n_levels, cond_dim)` over a
+vector of standardised per-organ median HU, summed with the phase embedding when
+both are on. `G.cond_vec(phase, level)` builds the combined vector and is public
+because the discriminator needs the identical one.
+
+Values come from `splits/levels.json` (`scripts/dump_levels.py`) and are read from
+the **real CECT** — this is ORACLE information. The same checkpoint is evaluated
+three ways via `infer_volume.py --level_mode`:
+
+| mode | fed at inference | measures |
+|---|---|---|
+| `oracle` | the case's true level | the ceiling — error if level were known |
+| `population` | zeros (= standardised training mean) | must reproduce the unconditioned baseline |
+| `fixed` | `--level L` for every case | the deployable mode |
+
+**The reportable result is the oracle-minus-population gap**, never the oracle
+number alone. Because featHU *is* per-organ median-HU error, conditioning on organ
+medians is partly circular — always also run `scripts/heldout_feathu.py`, which
+recomputes featHU over the organs the model was *not* told about.
+
+Any organ that is missing or too small resolves to 0.0, which after
+standardisation *is* the population mean — so a partial case degrades to "no
+information" rather than to a wrong number.
+
+### Conditional discriminator — `use_cond_disc`, off by default
+`PatchGANDiscriminator(in_channels=…, cond_dim=…)`. With it on, D sees
+`cat([source, image])` (pix2pix's `D(x, y)`) instead of the image alone, and
+receives the same conditioning vector as G via a zero-init projection added to its
+deepest feature map.
+
+Both matter: an unconditional D is a texture critic with no idea which NCCT
+produced the image, and a D that cannot see the conditioning will penalise a
+*correct* arterial output for not looking venous.
+
+⚠ **The vector handed to D is always `.detach()`ed** (`Trainer._cond_for_d`). It is
+produced by G's embedding, so without the detach the D step's `backward()` frees
+G's graph and the generator step crashes — and, more subtly, D's gradients would
+reach G's conditioning embedding, letting G lower the adversarial loss by
+reshaping what it *claims* was requested instead of by improving the image.
 
 Parameters are heavily back-loaded:
 
@@ -333,7 +384,9 @@ scenario definitions** — those are the `SCENARIOS` array in `run_scenarios.sh`
 | `SEG_SUFFIX` | must stay `'_seg_full'` — `_seg_reg` uses different label ids |
 | `TARGET_PHASES` | `['venous']`; add `'arterial'` to train one model on both |
 | `USE_PHASE_COND` / `PHASE_COND_DIM` | `False` / `64` |
-| `IN_CHANNELS` | `1` (`2k+1` for a 2.5-D slice stack) |
+| `N_INPUT_SLICES` / `IN_CHANNELS` | `1` / derived (`2k+1` for a 2.5-D slice stack) |
+| `COND_ORGANS` / `LEVELS_JSON` | `[]` / `splits/levels.json` |
+| `USE_COND_DISC` | `False` |
 
 Seeding is complete: `set_seed()` at `train.py:45` covers `random`/`numpy`/`torch`
 and the cuDNN determinism flags, `dataset.py:690` passes a `torch.Generator` and
@@ -390,6 +443,9 @@ python scripts/seeds_stats.py           # mean ± std across _s<N> replicates
 python scripts/audit_data_ceiling.py    # is the residual the model's or the data's?
 python scripts/spacing_stats.py         # voxel spacing -> physical patch FOV
 python scripts/audit_enhancement.py     # does the model track each case's contrast level?
+python scripts/dump_levels.py           # -> splits/levels.json (ORACLE per-case levels)
+python scripts/probe_level_predictability.py   # is the level predictable from the NCCT at all?
+python scripts/heldout_feathu.py        # featHU over non-conditioned organs (non-circular)
 python scripts/capacity_profile.py      # per-module params, VRAM, patch/s
 python scripts/erf.py --compare_norms   # effective receptive field
 python scripts/norm_attribution.py      # seam attribution per norm kind
@@ -406,6 +462,7 @@ python tests/test_metrics.py            # 15 checks
 python tests/test_patch_cache.py        # 9 checks — cache correctness
 python tests/test_max_train_cases.py    # 9 checks — probe caps train only, cache key differs
 python tests/test_phase_cond.py         # 19 checks — FiLM no-op/zero-init, dims=3, no leakage
+python tests/test_level_cond.py         # 24 checks — level cond, conditional D, 2.5-D clamping
 python tests/smoke_test_organ_weights.py
 python tests/smoke_test_organ_focus.py
 python tests/smoke_test.py              # 12 loss scenarios, GPU-free

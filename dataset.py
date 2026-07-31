@@ -258,6 +258,41 @@ class CTPairDataset(Dataset):
         self.half_w = self.pw // 2
         self.half_d = self.patch_depth // 2
 
+        # 2.5-D: feed 2k+1 adjacent axial slices as CHANNELS and predict the
+        # centre slice. The source patch is (2k+1, H, W) while the target stays
+        # (H, W) — the one place in this file where src and tgt shapes differ.
+        # Motivation: the aorta runs 258 mm in z but patch_depth=1 shows the
+        # model 1.5 mm of it (PROJECT_PLAN.md 1.5).
+        # Level conditioning. `cond_organs` names which organs' median HU form the
+        # conditioning vector; the values come from splits/levels.json, which is
+        # ORACLE information read from the real CECT (see scripts/dump_levels.py).
+        # Missing entries fall back to the population mean, which after
+        # standardisation is a vector of zeros.
+        self.cond_organs = list(cfg.get('cond_organs') or [])
+        self._levels = None
+        if self.cond_organs:
+            lp = Path(cfg.get('levels_json', 'splits/levels.json'))
+            if not lp.exists():
+                raise FileNotFoundError(
+                    f"cond_organs={self.cond_organs} needs {lp} — run "
+                    f"`python scripts/dump_levels.py` first")
+            self._levels = json.loads(lp.read_text())
+            missing = [o for o in self.cond_organs if o not in self._levels['organs']]
+            if missing:
+                raise ValueError(f"cond_organs not in {lp}: {missing}")
+            self._lv_idx = [self._levels['organs'].index(o) for o in self.cond_organs]
+            st = self._levels['standardize']
+            self._lv_mean = [st['mean'][i] for i in self._lv_idx]
+            self._lv_std  = [st['std'][i] or 1.0 for i in self._lv_idx]
+
+        self.n_input_slices = int(cfg.get('n_input_slices', 1))
+        if self.n_input_slices % 2 == 0:
+            raise ValueError(f"n_input_slices must be odd, got {self.n_input_slices}")
+        self.k_slices = (self.n_input_slices - 1) // 2
+        if self.k_slices and self.patch_depth != 1:
+            raise ValueError("n_input_slices>1 is a 2.5-D mode and needs patch_depth=1; "
+                             f"got patch_depth={self.patch_depth}")
+
         stride_ratio = 1.0 - cfg.get('overlap', 0.5)
         self.stride_h = max(1, int(self.ph * stride_ratio))
         self.stride_w = max(1, int(self.pw * stride_ratio))
@@ -336,6 +371,7 @@ class CTPairDataset(Dataset):
             # construction, so phase 0 for every patch is the correct reading.
             self.phase_ids = (list(data['phase_id']) if 'phase_id' in data
                               else [0] * len(self.src_patches))
+            self.level_vecs = (list(data['level']) if 'level' in data else [])
             if self.case_ids is None:
                 log.info(f"  [{split_name}] cache predates per-patch provenance — "
                          f"sample grids will be random but unlabelled "
@@ -369,6 +405,7 @@ class CTPairDataset(Dataset):
         # same NCCT is the source for both the arterial and the venous pair, so
         # src_path does not identify the phase.
         path_to_phase: Dict[str, int] = {}
+        path_to_level: Dict[str, List[float]] = {}
         for pair in pairs:
             src_path = pair['source_path']
             tgt_path = pair['target_path']
@@ -376,6 +413,10 @@ class CTPairDataset(Dataset):
             case_id  = pair['case_id']
             path_to_case[src_path] = case_id
             path_to_phase[tgt_path] = int(pair.get('phase_id', 0))
+            if self.cond_organs:
+                path_to_level[tgt_path] = standardised_level(
+                    self._levels, case_id, pair.get('phase', 'venous'),
+                    self.cond_organs, self._lv_idx, self._lv_mean, self._lv_std)
             if self.load_mask and seg_path is None:
                 n_missing_seg += 1
             try:
@@ -444,6 +485,7 @@ class CTPairDataset(Dataset):
             self.case_ids = []
             self.patch_z = []
             self.phase_ids = []
+            self.level_vecs = []
             return
 
         # ── Step 2: sub-sample (mixing organ-focused + grid candidates) ───────
@@ -469,6 +511,7 @@ class CTPairDataset(Dataset):
         self.case_ids     = []
         self.patch_z      = []
         self.phase_ids    = []
+        self.level_vecs   = []
 
         def _crop(vol, z, y, x):
             if self.patch_depth == 1:
@@ -479,12 +522,28 @@ class CTPairDataset(Dataset):
                        y - self.half_h:  y + self.half_h,
                        x - self.half_w:  x + self.half_w].copy()
 
+        def _crop_src(vol, z, y, x):
+            """Source crop. 2.5-D returns (2k+1, H, W) with EDGE-CLAMPED z.
+
+            Clamping rather than shrinking the z range: inference has to produce
+            slice 0 and slice D-1 regardless, so the window must be defined
+            there. Using the same rule in training avoids a train/test mismatch
+            at the volume ends, and costs no slices.
+            """
+            if self.k_slices == 0:
+                return _crop(vol, z, y, x)
+            zs = np.clip(np.arange(z - self.k_slices, z + self.k_slices + 1),
+                         0, vol.shape[0] - 1)
+            return vol[zs,
+                       y - self.half_h: y + self.half_h,
+                       x - self.half_w: x + self.half_w].copy()
+
         for src_path, tgt_path, seg_path, z, y, x in tqdm(coords, desc=f'Preload [{split_name}]', leave=False):
             src_vol = _load_vol(src_path)
             tgt_vol = _load_vol(tgt_path)
 
-            sp = _crop(src_vol, z, y, x)
-            tp = _crop(tgt_vol, z, y, x)
+            sp = _crop_src(src_vol, z, y, x)
+            tp = _crop(tgt_vol, z, y, x)      # target is always the centre slice
 
             sp = np.clip(sp, self.hu_min, self.hu_max)
             sp = ((sp - self.hu_min) / (self.hu_max - self.hu_min)).astype(np.float32)
@@ -496,6 +555,9 @@ class CTPairDataset(Dataset):
             self.case_ids.append(path_to_case.get(src_path, 'unknown'))
             self.patch_z.append(int(z))
             self.phase_ids.append(path_to_phase.get(tgt_path, 0))
+            if self.cond_organs:
+                self.level_vecs.append(path_to_level.get(
+                    tgt_path, [0.0] * len(self.cond_organs)))
 
             if self.load_mask:
                 mp = np.zeros_like(sp)
@@ -523,6 +585,8 @@ class CTPairDataset(Dataset):
                            'case_id': np.array(self.case_ids),   # plain unicode array, no pickle
                            'patch_z': np.array(self.patch_z, dtype=np.int32),
                            'phase_id': np.array(self.phase_ids, dtype=np.int64)}
+            if self.cond_organs:
+                save_kwargs['level'] = np.asarray(self.level_vecs, dtype=np.float32)
             if self.load_mask:
                 save_kwargs['mask'] = np.stack(self.mask_patches)
             np.savez(self._cache_file, **save_kwargs)
@@ -638,6 +702,10 @@ class CTPairDataset(Dataset):
             # anyway — this is explicit rather than incidental.
             'target_phases': list(cfg.get('target_phases')
                                   or [cfg.get('target_phase', 'venous')]),
+            # Changes the SHAPE of every cached source patch.
+            'n_input_slices': int(cfg.get('n_input_slices', 1)),
+            # Changes the CONTENT of the cached level vectors.
+            'cond_organs': list(cfg.get('cond_organs') or []),
         }
         # Only perturb the cache key when organ-focus is on, so existing
         # uniform-grid caches remain valid for legacy (frac==0) runs.
@@ -654,7 +722,12 @@ class CTPairDataset(Dataset):
         return len(self.src_patches)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        src = torch.from_numpy(self.src_patches[idx]).unsqueeze(0)  # (1, H, W) or (1, D, H, W)
+        # 2.5-D source patches are already (2k+1, H, W) — the slice stack IS the
+        # channel axis, so no unsqueeze. Everything else gets a channel axis added.
+        sp = self.src_patches[idx]
+        src = torch.from_numpy(sp)
+        if getattr(self, 'n_input_slices', 1) == 1:
+            src = src.unsqueeze(0)                                  # (1, H, W) or (1, D, H, W)
         tgt = torch.from_numpy(self.tgt_patches[idx]).unsqueeze(0)
         item = {'source': src, 'target': tgt}
         # Always emitted (0 for single-phase runs) so the batch schema does not
@@ -662,6 +735,8 @@ class CTPairDataset(Dataset):
         # was built with use_phase_cond.
         item['phase'] = torch.tensor(
             self.phase_ids[idx] if self.phase_ids else 0, dtype=torch.long)
+        if self.level_vecs:
+            item['level'] = torch.as_tensor(self.level_vecs[idx], dtype=torch.float32)
         if self.mask_patches:
             item['mask'] = torch.from_numpy(self.mask_patches[idx]).unsqueeze(0)
         return item
@@ -733,6 +808,24 @@ class CTPairDataset(Dataset):
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+def standardised_level(levels: Dict, case_id: str, phase: str,
+                       organs: List[str], idx: List[int],
+                       mean: List[float], std: List[float]) -> List[float]:
+    """Standardised per-organ level vector for one (case, phase).
+
+    Any organ that is absent, too small to measure, or missing from the dump
+    resolves to 0.0 — which after standardisation IS the population mean. So a
+    partially-missing case degrades to 'no information' rather than to a wrong
+    number, and 'population' inference mode is just an all-zeros vector.
+    """
+    rec = (levels.get('cases', {}).get(case_id) or {}).get(phase)
+    out = []
+    for j, o in enumerate(organs):
+        v = float('nan') if rec is None else rec.get('cect', {}).get(o, float('nan'))
+        out.append(0.0 if not np.isfinite(v) else (v - mean[j]) / std[j])
+    return out
+
 
 def build_loaders(cfg: Dict) -> Tuple[DataLoader, DataLoader]:
     """

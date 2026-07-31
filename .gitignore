@@ -20,3 +20,6 @@ develope/
 # so it is force-added and re-included here.
 *.pkl
 !orgFeatXGB_CTPhase/xgb_vindr_full.pkl
+
+# Recurring rsync artifact: a relative destination clones the repo into itself.
+synthetic_CECT/

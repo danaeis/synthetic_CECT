@@ -67,9 +67,49 @@ TARGET_PHASES = [TARGET_PHASE]
 # to a model compiled without the feature.
 USE_PHASE_COND = False
 PHASE_COND_DIM = 64
-# Generator input channels. 1 today; set to 2k+1 to feed a stack of adjacent
-# axial slices ("2.5-D") and predict the centre slice.
-IN_CHANNELS    = 1
+
+# ── Level conditioning ────────────────────────────────────────────────────────
+# Organs whose median HU forms a CONTINUOUS conditioning vector, read from the
+# real CECT via splits/levels.json (`python scripts/dump_levels.py`). Empty = off.
+#
+# Why: scripts/audit_enhancement.py measured that the model recovers only ~18% of
+# case-to-case enhancement variation and is 5.7x under-dispersed — it emits the
+# training-set average level because dose and bolus timing are invisible in an
+# NCCT. Conditioning measures how much of the residual that accounts for.
+#
+# This is ORACLE information. The same checkpoint is evaluated three ways
+# (infer_volume.py --level_mode): oracle / population / fixed. The reportable
+# result is the ORACLE-MINUS-POPULATION GAP, never the oracle number alone.
+#
+# Note featHU IS per-organ median-HU error, so conditioning on many organs makes
+# it partly circular — always also report featHU on the HELD-OUT organs
+# (scripts/heldout_feathu.py). The ablation aorta -> aorta+PV -> all-8 makes that
+# contamination visible instead of hiding it.
+COND_ORGANS  = []
+LEVELS_JSON  = 'splits/levels.json'
+
+# Conditional discriminator: D sees cat([source, image]) instead of the image
+# alone — pix2pix's D(x, y). It also receives the same conditioning vector as G,
+# without which a D trained mostly on venous data penalises correct arterial
+# output. Off by default so existing runs are reproducible.
+USE_COND_DISC = False
+# ── 2.5-D input ───────────────────────────────────────────────────────────────
+# Number of adjacent axial slices fed as CHANNELS (must be odd); the target is
+# always the centre slice alone. 1 = plain 2-D.
+#
+# Why: spacing is uniform 1.5 mm isotropic and a 128-px patch already spans
+# 192 mm in-plane, which covers every organ cross-section — but patch_depth=1
+# shows the model 1.5 mm of an aorta that runs 258 mm. Z is the only geometric
+# deficiency that survived measurement (PROJECT_PLAN.md 1.5). k=2 buys 7.5 mm,
+# k=5 buys 16.5 mm, for essentially no extra parameters.
+#
+# The z window is EDGE-CLAMPED, not shrunk: inference must emit slice 0 and
+# D-1 regardless, so clamping there is unavoidable, and using the same rule in
+# training avoids a boundary train/test mismatch.
+N_INPUT_SLICES = 1
+
+# Generator input channels — derived, do not set by hand.
+IN_CHANNELS    = N_INPUT_SLICES
 
 # ── HU normalisation ──────────────────────────────────────────────────────────
 # Data-driven via analyze_hu_range.py, but NOT its raw p0.5-p99.5 output
@@ -471,6 +511,10 @@ train_config: dict = dict(
     use_phase_cond       = USE_PHASE_COND,
     phase_cond_dim       = PHASE_COND_DIM,
     in_channels          = IN_CHANNELS,
+    n_input_slices       = N_INPUT_SLICES,
+    cond_organs          = COND_ORGANS,
+    levels_json          = LEVELS_JSON,
+    use_cond_disc        = USE_COND_DISC,
     # HU normalisation
     hu_min               = HU_MIN,
     hu_max               = HU_MAX,

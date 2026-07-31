@@ -40,7 +40,7 @@ import nibabel as nib
 import numpy as np
 import torch
 
-from dataset import _load_vol, find_pairs_and_split
+from dataset import _load_vol, find_pairs_and_split, standardised_level
 from models import UNetGenerator
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
@@ -62,6 +62,7 @@ def load_generator(ckpt_path: str, cfg: Dict, device: str) -> UNetGenerator:
         use_phase_cond= cfg.get('use_phase_cond', False),
         n_phases      = max(2, len(_phases)),
         cond_dim      = cfg.get('phase_cond_dim', 64),
+        n_levels      = len(cfg.get('cond_organs') or []),
     ).to(device)
     # weights_only=False: checkpoints also carry non-tensor state (history,
     # early_stop, ...); we only read G_state but must be able to unpickle them.
@@ -123,7 +124,8 @@ def _axis_window(n: int, mode: str, margin: int,
 def infer_volume(G: UNetGenerator, vol_dhw: np.ndarray, cfg: Dict, device: str,
                  batch_size: int = 32, blend: str = 'hann',
                  edge_margin: int = 0, overlap: Optional[float] = None,
-                 phase_id: Optional[int] = None) -> np.ndarray:
+                 phase_id: Optional[int] = None,
+                 level: Optional[np.ndarray] = None) -> np.ndarray:
     """Reconstruct a full synthetic CECT volume (HU, (D,H,W)) from an NCCT volume.
 
     Weighted overlap-blending. Patches are normalised/denormalised with the run's
@@ -143,6 +145,10 @@ def infer_volume(G: UNetGenerator, vol_dhw: np.ndarray, cfg: Dict, device: str,
     overlap is free to be higher than what training used.
     """
     pd = int(cfg.get('patch_depth', 1))
+    # 2.5-D: gather 2k+1 adjacent slices as channels, still emit one slice. Output
+    # depth is unchanged, so all the blending/windowing below is untouched.
+    n_in = int(cfg.get('n_input_slices', 1))
+    k_sl = (n_in - 1) // 2
     ps = cfg['patch_size']
     ph, pw = (int(ps), int(ps)) if isinstance(ps, int) else (int(ps[0]), int(ps[1]))
     hu_min = float(cfg.get('hu_min', -200)); hu_max = float(cfg.get('hu_max', 400))
@@ -193,14 +199,30 @@ def infer_volume(G: UNetGenerator, vol_dhw: np.ndarray, cfg: Dict, device: str,
     def _flush():
         if not buf_patch:
             return
-        batch = torch.from_numpy(np.stack(buf_patch)).unsqueeze(1).to(device)  # (B,1,...)
+        arr = np.stack(buf_patch)
+        # 2.5-D patches already carry the slice stack in the channel axis.
+        batch = torch.from_numpy(arr).to(device)
+        if k_sl == 0:
+            batch = batch.unsqueeze(1)                                  # (B,1,...)
         # Phase is per-tile and constant across the volume, so it is broadcast to
         # the batch here rather than carried through the tiling bookkeeping.
         ph_t = (torch.full((batch.shape[0],), int(phase_id),
                            dtype=torch.long, device=device)
                 if getattr(G, 'use_phase_cond', False) else None)
+        # Level is constant across the volume, so it is broadcast here rather
+        # than carried through the tiling bookkeeping.
+        lv_t = (torch.as_tensor(level, dtype=torch.float32, device=device)
+                .reshape(1, -1).expand(batch.shape[0], -1)
+                if getattr(G, 'n_levels', 0) else None)
+        # Only pass conditioning that actually exists, so infer_volume still
+        # works with any plain generator whose forward is just forward(x).
+        gkw = {}
+        if ph_t is not None:
+            gkw['phase'] = ph_t
+        if lv_t is not None:
+            gkw['level'] = lv_t
         with torch.autocast('cuda', enabled=use_amp):
-            out = G(batch, ph_t)
+            out = G(batch, **gkw)
         out = out.squeeze(1).float().cpu().numpy()   # (B, ...) in [0,1]
         for (d0, y0, x0), o in zip(buf_coord, out):
             w = _window(d0, y0, x0)
@@ -217,6 +239,11 @@ def infer_volume(G: UNetGenerator, vol_dhw: np.ndarray, cfg: Dict, device: str,
             for x0 in w_starts:
                 if pd > 1:
                     patch = vn[d0:d0+pd, y0:y0+ph, x0:x0+pw]     # (pd,ph,pw)
+                elif k_sl:
+                    # Edge-clamped, matching dataset.py's _crop_src exactly, so
+                    # the model sees the same boundary behaviour it trained on.
+                    zs = np.clip(np.arange(d0 - k_sl, d0 + k_sl + 1), 0, Dp - 1)
+                    patch = vn[zs, y0:y0+ph, x0:x0+pw]           # (2k+1,ph,pw)
                 else:
                     patch = vn[d0, y0:y0+ph, x0:x0+pw]           # (ph,pw)
                 buf_patch.append(patch); buf_coord.append((d0, y0, x0))
@@ -244,7 +271,8 @@ def infer_volume(G: UNetGenerator, vol_dhw: np.ndarray, cfg: Dict, device: str,
 
 def run(scenario_dir: str, split: str, out_dir: str, ckpt_name: str,
         batch_size: int, device: str, blend: str = 'hann',
-        edge_margin: int = 0, overlap: Optional[float] = None):
+        edge_margin: int = 0, overlap: Optional[float] = None,
+        level_mode: str = 'oracle', level: Optional[float] = None):
     sdir = Path(scenario_dir)
     cfg = json.loads((sdir / 'run_config.json').read_text())
     ckpt = sdir / ckpt_name
@@ -257,6 +285,45 @@ def run(scenario_dir: str, split: str, out_dir: str, ckpt_name: str,
     pairs = {'val': val_pairs, 'test': test_pairs,
              'both': val_pairs + test_pairs}[split]
     log.info(f"Inferring {len(pairs)} {split} case(s) for scenario '{sdir.name}'")
+
+    # ── level conditioning at inference ──────────────────────────────────────
+    # Same checkpoint, three modes. The REPORTABLE RESULT is the gap between
+    # 'oracle' and 'population' — oracle reads the answer off the real CECT and
+    # can never be a headline number on its own.
+    #
+    #   oracle      the case's true standardised level      -> the ceiling
+    #   population  all zeros == the training-set mean      -> must match baseline
+    #   fixed       --level L, standardised, for every case -> the deployable mode
+    cond_organs = list(cfg.get('cond_organs') or [])
+    levels_db = None
+    if cond_organs:
+        if level_mode not in ('oracle', 'population', 'fixed'):
+            raise ValueError(f"unknown level_mode {level_mode!r}")
+        lp = Path(cfg.get('levels_json', 'splits/levels.json'))
+        if level_mode == 'oracle' and not lp.exists():
+            raise FileNotFoundError(f"level_mode=oracle needs {lp}")
+        if lp.exists():
+            levels_db = json.loads(lp.read_text())
+        log.info(f"level conditioning: {len(cond_organs)} organ(s), mode={level_mode}"
+                 + (f", level={level}" if level_mode == 'fixed' else ""))
+
+    def _level_for(case_id: str, phase: str):
+        if not cond_organs:
+            return None
+        n = len(cond_organs)
+        if level_mode == 'population':
+            return np.zeros(n, np.float32)      # standardised mean
+        if level_mode == 'fixed':
+            st = levels_db['standardize']
+            idx = [levels_db['organs'].index(o) for o in cond_organs]
+            return np.array([(level - st['mean'][i]) / (st['std'][i] or 1.0)
+                             for i in idx], np.float32)
+        idx = [levels_db['organs'].index(o) for o in cond_organs]
+        st = levels_db['standardize']
+        return np.array(standardised_level(
+            levels_db, case_id, phase, cond_organs, idx,
+            [st['mean'][i] for i in idx],
+            [st['std'][i] or 1.0 for i in idx]), np.float32)
 
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     default_phase = cfg.get('target_phase', 'venous')
@@ -283,7 +350,8 @@ def run(scenario_dir: str, split: str, out_dir: str, ckpt_name: str,
         src_dhw = _load_vol(pair['source_path'])
         syn_hu_dhw = infer_volume(G, src_dhw, cfg, device, batch_size=batch_size,
                                   blend=blend, edge_margin=edge_margin, overlap=overlap,
-                                  phase_id=pair.get('phase_id', 0))
+                                  phase_id=pair.get('phase_id', 0),
+                                  level=_level_for(case_id, ph))
         # back to native (X,Y,Z) orientation to match real/mask that phase_eval
         # loads raw; save on the source grid/affine.
         syn_xyz = np.transpose(syn_hu_dhw, (2, 1, 0)).astype(np.float32)
@@ -313,6 +381,14 @@ def main():
     ap.add_argument('--split', default='test', choices=['val', 'test', 'both'])
     ap.add_argument('--out_dir', default=None, help='default: <scenario_dir>/phase_infer')
     ap.add_argument('--ckpt_name', default='best_model.pth')
+    ap.add_argument('--level_mode', default='oracle',
+                    choices=['oracle', 'population', 'fixed'],
+                    help="oracle = the case's true level (the CEILING, leaks the "
+                         "target); population = training mean (must reproduce the "
+                         "unconditioned baseline); fixed = --level for every case. "
+                         "Report the oracle-vs-population GAP, never oracle alone.")
+    ap.add_argument('--level', type=float, default=None,
+                    help='HU value for --level_mode fixed')
     ap.add_argument('--batch_size', type=int, default=32)
     ap.add_argument('--blend', default='hann', choices=['uniform', 'hann', 'gaussian'],
                     help="tile blend window. 'uniform' is the original flat average "
@@ -330,7 +406,8 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     out_dir = args.out_dir or str(Path(args.scenario_dir) / 'phase_infer')
     run(args.scenario_dir, args.split, out_dir, args.ckpt_name, args.batch_size, device,
-        blend=args.blend, edge_margin=args.edge_margin, overlap=args.overlap)
+        blend=args.blend, edge_margin=args.edge_margin, overlap=args.overlap,
+        level_mode=args.level_mode, level=args.level)
 
 
 if __name__ == '__main__':

@@ -106,6 +106,49 @@ SCENARIOS=(
   # exceeds the measured 2-sigma gate of 0.82 HU.
   "multiphase_uncond|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --target_phases venous arterial"
   "multiphase_film|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --target_phases venous arterial --use_phase_cond"
+
+  # ── B0: the texture baseline everything below builds on ────────────────────
+  # GroupNorm is the validated best (val 8.50 vs 8.86 HU at 3 seeds, ~13x the
+  # 2-sigma gate). Adversarial restores texture: on the seed-42 table it is 2.1x
+  # better on gradW1, 2.4x on organ-region gradW1 and 1.7x closer to 1.0 on
+  # raps_hf, for +0.30 HU featHU — INSIDE the 0.82 HU gate, i.e. free.
+  #
+  # The discriminator is now CONDITIONAL: cat([source, image]) rather than the
+  # image alone (pix2pix's D(x,y)), which is also a plausible fix for the
+  # observed instability (train_adv 0.52->0.96 while train_disc 0.245->0.178 —
+  # the discriminator was winning).
+  "b0_groupnorm_adv|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --generator_norm group --use_adversarial --use_cond_disc --adv_warmup_epochs 15 --lr_disc 5e-5"
+
+  # ── Level-conditioning ablation, on top of B0 ──────────────────────────────
+  # audit_enhancement.py: the model recovers only 18% of case-to-case level
+  # variation and is 5.7x under-dispersed. These ask how much of the residual
+  # that accounts for, by telling it the level outright.
+  #
+  # Run `python scripts/dump_levels.py` FIRST — these need splits/levels.json.
+  #
+  # Evaluate each with infer_volume.py --level_mode {oracle,population}; the
+  # RESULT IS THE GAP. Oracle reads the answer off the real CECT and is never a
+  # headline number. featHU is partly circular here (it IS per-organ median-HU
+  # error), so also run scripts/heldout_feathu.py — and note the ablation exists
+  # precisely to make that contamination visible as it grows.
+  #
+  #   L1  1 scalar  -> 15 held-out organs
+  #   L2  2 scalars -> 14
+  #   L3  8 scalars ->  8
+  # If L1 already recovers most of it, contrast level is a single global latent
+  # factor. If recovery grows with each scalar, each organ carries independent
+  # unpredictable variation. Either way it is a result.
+  "level_aorta|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --generator_norm group --use_adversarial --use_cond_disc --adv_warmup_epochs 15 --lr_disc 5e-5 --cond_organs aorta"
+  "level_aorta_pv|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --generator_norm group --use_adversarial --use_cond_disc --adv_warmup_epochs 15 --lr_disc 5e-5 --cond_organs aorta portal_vein_and_splenic_vein"
+  "level_all8|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --generator_norm group --use_adversarial --use_cond_disc --adv_warmup_epochs 15 --lr_disc 5e-5 --cond_organs aorta portal_vein_and_splenic_vein inferior_vena_cava heart liver pancreas gallbladder colon"
+
+  # ── 2.5-D: the one geometric gap that survived measurement ─────────────────
+  # Spacing is uniform 1.5 mm isotropic and 128 px already spans 192 mm in-plane,
+  # but patch_depth=1 shows the model 1.5 mm of a 258 mm aorta. k=2 buys 7.5 mm,
+  # k=5 buys 16.5 mm, for essentially no extra parameters. Both change the
+  # patch-cache key -> one full re-preload each.
+  "slices5_k2|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --generator_norm group --n_input_slices 5"
+  "slices11_k5|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --generator_norm group --n_input_slices 11"
   # add more scenarios here, format: "name|--flag1 --flag2 ..."
 )
 
