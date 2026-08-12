@@ -49,6 +49,16 @@ actual fix; Tier 3 is how you prove it worked.
   data ceiling, not model failure. (A dedicated conditional-mean *oracle row* was not
   added — varR itself is the collapse detector — but could be added later if wanted.)
 
+- [x] **Categorised, architecture-grouped report.** `benchmark.master_table` now
+  renders one sub-table per metric category (image-level / organ-level / phase &
+  level fidelity / detail-focused texture / perceptual), with rows grouped by
+  generator family (UNet+PatchGAN / Diffusion / External / Reference-floor) and the
+  **best** / _second-best_ highlighted per column in each metric's own direction.
+  FID/LPIPS get their own perceptual category — the table renders them when run with
+  `--perceptual` (needs torch + lpips + pytorch-fid) and otherwise shows a note on
+  how to populate them. Covered by test_model_family / test_rank_marks /
+  test_master_table_categorised.
+
 ## Tier 2 — The actual fix: stop averaging over the unknown enhancement level
 
 Pick **2a first** (cheapest, machinery already exists); escalate to 2b if needed.
