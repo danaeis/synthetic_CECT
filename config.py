@@ -130,6 +130,22 @@ IN_CHANNELS    = N_INPUT_SLICES
 HU_MIN = -200                     # clip lower bound
 HU_MAX =  400                     # clip upper bound  → rescale to [0, 1]
 
+# Single source of truth: metrics.py owns the canonical scoring window, and the
+# training window MUST equal it or models get scored in a different domain than
+# they were trained in (the exact footgun that let dataset.py silently default to
+# a 300 ceiling). Assert equality at import time so any future edit to one side
+# fails loudly here. Only the ImportError is swallowed — for a torch-only tool
+# with no numpy/scipy — never a value mismatch.
+try:
+    import metrics as _metrics
+    assert (float(HU_MIN), float(HU_MAX)) == (_metrics.HU_MIN, _metrics.HU_MAX), (
+        f"HU window drift: config=({HU_MIN},{HU_MAX}) vs "
+        f"metrics=({_metrics.HU_MIN},{_metrics.HU_MAX}). These must match — see "
+        f"metrics.HU_MIN/HU_MAX (the canonical scoring domain).")
+    del _metrics
+except ImportError:
+    pass
+
 # ── Patch extraction ─────────────────────────────────────────────────────────
 PATCH_SIZE   = 128                # int → square, or (H, W) tuple
 PATCH_DEPTH  = 1                  # 1 = 2-D slice  |  >1 = 3-D sub-volume

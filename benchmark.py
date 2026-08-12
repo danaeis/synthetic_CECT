@@ -60,6 +60,75 @@ from organ_features import load_organ_label_map             # noqa: F401 (PhaseE
 
 PHASE_IDS = {'non-contrast': 0, 'arterial': 1, 'venous': 2, 'delayed': 3}
 
+# Contrast-carrying structures whose per-case enhancement LEVEL a phase-faithful
+# generator has to track. Level recovery is scored on these only (bowel/bladder
+# barely enhance, and their content is not inferable from NCCT). Mirrors
+# scripts/audit_enhancement.py's KEY_ORGANS vessels — the same quantity, folded
+# into the master table so it is visible without a separate script run.
+LEVEL_ORGANS = ['aorta', 'portal_vein_and_splenic_vein',
+                'inferior_vena_cava', 'liver']
+
+_LEVEL_MIN_VOXELS = 64      # below this an organ median is too noisy to regress on
+_LEVEL_MIN_CASES  = 3       # a slope needs at least this many valid cases
+
+
+def _level_recovery(real: np.ndarray, gen: np.ndarray) -> Dict[str, float]:
+    """Across-case level-tracking stats for ONE organ: does the generator follow
+    each case's true enhancement, or emit a constant?
+
+    Given paired per-case (real_median_HU, gen_median_HU) arrays:
+      * beta      — slope of gen ~ real. 1 = tracks the case, 0 = constant output.
+      * var_ratio — var(gen)/var(real). → 0 is the textbook signature of a loss
+                    regressing to the conditional mean under irreducible
+                    uncertainty (see scripts/audit_enhancement.py).
+      * bias      — mean(gen - real) HU.
+    NaNs (organ absent / too small in a case) are dropped pairwise. Identical math
+    to audit_enhancement._fit, kept self-contained so benchmark.py stays runnable
+    without importing the scripts/ tree.
+    """
+    real = np.asarray(real, float)
+    gen = np.asarray(gen, float)
+    ok = np.isfinite(real) & np.isfinite(gen)
+    real, gen = real[ok], gen[ok]
+    n = int(len(real))
+    nan = float('nan')
+    if n < _LEVEL_MIN_CASES or np.std(real) == 0:
+        return {'beta': nan, 'var_ratio': nan, 'bias': nan, 'n': n}
+    beta = float(np.polyfit(real, gen, 1)[0])
+    sd_r, sd_g = float(np.std(real)), float(np.std(gen))
+    return {
+        'beta':      beta,
+        'var_ratio': (sd_g ** 2 / sd_r ** 2) if sd_r > 0 else nan,
+        'bias':      float(np.mean(gen - real)),
+        'n':         n,
+    }
+
+
+def _organ_medians(real: np.ndarray, gen: np.ndarray, mask: np.ndarray,
+                   organ_map: Optional[Dict[str, int]]) -> Dict[str, tuple]:
+    """Per-organ (real_median_HU, gen_median_HU) for LEVEL_ORGANS in one case.
+
+    HU space on both sides, so var_ratio is a ratio of like units. Returns NaNs
+    for any organ absent or below the voxel floor. Never raises — a bad mask
+    degrades this case's level stats to NaN rather than failing the whole table.
+    """
+    out: Dict[str, tuple] = {}
+    if not organ_map:
+        return out
+    for o in LEVEL_ORGANS:
+        lid = organ_map.get(o)
+        if lid is None:
+            continue
+        try:
+            sel = mask == lid
+            if int(sel.sum()) < _LEVEL_MIN_VOXELS:
+                out[o] = (float('nan'), float('nan'))
+            else:
+                out[o] = (float(np.median(real[sel])), float(np.median(gen[sel])))
+        except Exception:      # noqa: BLE001 — never let one case break the run
+            out[o] = (float('nan'), float('nan'))
+    return out
+
 
 def _load(p: str) -> np.ndarray:
     import nibabel as nib
@@ -115,7 +184,8 @@ def read_tiling(manifest: Path) -> Dict:
 
 def score_model(name: str, manifest: Path, ev: PhaseEvaluator,
                 hu_min: float, hu_max: float, gen_in_hu: bool,
-                tiling: Optional[Dict] = None, scorer=None) -> List[Dict]:
+                tiling: Optional[Dict] = None, scorer=None,
+                organ_map: Optional[Dict[str, int]] = None) -> List[Dict]:
     """Full per-case metric rows for one model.
 
     `scorer` is an optional `perceptual.PerceptualScorer`: when present each case
@@ -169,6 +239,12 @@ def score_model(name: str, manifest: Path, ev: PhaseEvaluator,
         ph = ev.score_case(gen, real, mask, tp, hu_min=hu_min, hu_max=hu_max,
                             gen_in_hu=gen_in_hu)
 
+        # Per-organ median HU for the across-case level-recovery stats. Only
+        # meaningful when the generated volume is already HU: a var_ratio between
+        # HU (real) and an arbitrary model scale (gen) would not be comparable, so
+        # skip it rather than report a misleading number.
+        lvl = _organ_medians(real, gen, mask, organ_map) if gen_in_hu else {}
+
         rows.append({
             'model': name,
             # Join key across models = the full REAL CECT path: identical for a
@@ -190,6 +266,7 @@ def score_model(name: str, manifest: Path, ev: PhaseEvaluator,
             'gen_prob': ph['gen_target_prob'],
             'feature_l1_hu': ph['feature_l1_hu'],
             '_phase_case': ph,       # kept for the phase aggregate()
+            '_lvl': lvl,             # {organ: (real_median_hu, gen_median_hu)}
         })
     return rows
 
@@ -221,6 +298,30 @@ def summarise(name: str, rows: List[Dict]) -> Dict:
         'gen_prob': ph.get('mean_gen_target_prob'),
         'feature_l1_hu': ph.get('mean_feature_l1_hu'),
     })
+
+    # Across-case level recovery: regress gen median HU on real median HU per
+    # organ (needs every case's medians at once, so it lives here, not per-case),
+    # then average slope and var_ratio over the LEVEL_ORGANS that have enough
+    # cases. beta→1 / var_ratio→1 = the model tracks each case's enhancement;
+    # beta→0 / var_ratio→0 = it emits the population average and is
+    # indistinguishable from a conditional-mean predictor. These are the two
+    # columns that actually move when variance collapse is addressed.
+    betas, vrs, per_organ = [], [], {}
+    for o in LEVEL_ORGANS:
+        pairs = [r.get('_lvl', {}).get(o) for r in rows]
+        pairs = [p for p in pairs if p is not None]
+        if not pairs:
+            continue
+        rec = _level_recovery(np.array([p[0] for p in pairs]),
+                              np.array([p[1] for p in pairs]))
+        per_organ[o] = rec
+        if not math.isnan(rec['beta']):
+            betas.append(rec['beta'])
+        if not math.isnan(rec['var_ratio']):
+            vrs.append(rec['var_ratio'])
+    out['lev_beta'] = float(np.mean(betas)) if betas else float('nan')
+    out['lev_varr'] = float(np.mean(vrs)) if vrs else float('nan')
+    out['_lev_per_organ'] = per_organ
     return out
 
 
@@ -332,6 +433,7 @@ def master_table(summaries: List[Dict], out: List[str], perceptual: bool = False
             ('body_frac', 'body%', '{:.2f}'),
             ('phase_acc', 'phase', '{:.2f}'), ('gen_prob', 'prob', '{:.4f}'),
             ('feature_l1_hu', 'featHU', '{:.2f}'),
+            ('lev_beta', 'βlev', '{:.2f}'), ('lev_varr', 'varR', '{:.2f}'),
             ('raps_hf', 'RAPS', '{:.3f}'), ('grad_w1', 'gradW1', '{:.4f}'),
             ('org_grad_w1', 'oGradW1', '{:.4f}'),
             ('seam', 'seam', '{:.3f}'), ('zflicker', 'zflick', '{:.3f}'),
@@ -347,8 +449,29 @@ def master_table(summaries: List[Dict], out: List[str], perceptual: bool = False
             cells.append(fmt.format(v) if isinstance(v, (int, float)) and not
                          (isinstance(v, float) and math.isnan(v)) else '—')
         out.append(f"| {s['model']} | " + ' | '.join(cells) + ' |')
+    out.append('\n**How to read this table.** The global pixel columns '
+               '(PSNR/SSIM/MAE/MSE/PCC) are SECONDARY and flat by construction: '
+               '`to_unit` saturates air/lung/fat→0 and bone→1 identically in every '
+               'model, so those columns average over a large error-free mass and an '
+               'identity copy of the NCCT already scores most of the way to the best '
+               'model on them (see metrics.py:body_mask). Read the PRIMARY columns '
+               'instead — organ-region (oMAE/oSSIM), phase fidelity (phase/prob/'
+               'featHU) and level recovery (βlev/varR).')
     out.append('\noPSNR/oSSIM/oMAE = organ-region. featHU = mean per-organ |HU error|. '
                'Higher PSNR/SSIM/PCC/prob/phase better; lower MAE/MSE/featHU better.')
+    out.append('\n**Level recovery** (βlev, varR): generated per-organ median HU '
+               'regressed on the real one across cases, averaged over '
+               f'{", ".join(LEVEL_ORGANS)}. **βlev** = mean slope and **varR** = mean '
+               'var(gen)/var(real). Both target **1.0**: βlev/varR → 1 means the '
+               'model tracks each case\'s true contrast level; βlev/varR → 0 means it '
+               'emits the population average and is indistinguishable from a '
+               'conditional-mean predictor — the textbook signature of an L1/L2 loss '
+               'under irreducible enhancement uncertainty (dose/bolus timing are not '
+               'visible in NCCT). featHU can look decent while varR is near 0, so '
+               'these two columns are what separate a real generator from an averager '
+               '(full breakdown: scripts/audit_enhancement.py). βlev/varR are NaN when '
+               'generated volumes are not in HU (--gen_not_hu) or an organ map is '
+               'unavailable.')
     out.append('\n**Texture and consistency** (`metrics.py`): RAPS = high-frequency '
                'spectral energy vs real; gradW1/oGradW1 = W1 distance between '
                'gradient-magnitude distributions, global and organ-region; seam = '
@@ -534,7 +657,8 @@ def main():
             print(f'  [{name}] manifest missing: {mpath} — skipped')
             continue
         rows = score_model(name, mpath, ev, args.hu_min, args.hu_max, gen_in_hu,
-                           tiling=read_tiling(mpath), scorer=scorer)
+                           tiling=read_tiling(mpath), scorer=scorer,
+                           organ_map=organ_map)
         if not rows:
             print(f'  [{name}] no scored cases — skipped')
             continue

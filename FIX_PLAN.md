@@ -17,37 +17,37 @@ actual fix; Tier 3 is how you prove it worked.
 
 ---
 
-## Tier 0 — Correctness / consistency (do first, ~30 min)
+## Tier 0 — Correctness / consistency (do first, ~30 min)  ✅ DONE
 
-- [ ] **Fix the HU-window default mismatch.**
-  `dataset.py:307` defaults `hu_max=300`; `config.py:131` uses `400`. Config wins in
-  the normal path, but any dataset built without config trains on a different domain
-  than the benchmark scores on (`metrics.py:77` = [-200,400]).
-  → Make `hu_min`/`hu_max` **required** in the dataset (no silent default), or set
-  the defaults to `-200/400` to match config. Add an assert that dataset and
-  `metrics.to_unit` share the same window.
+- [x] **Fix the HU-window default mismatch.**
+  `dataset.py` default was `hu_max=300` while `config.py` uses `400`. Fixed the
+  fallback to `-200/400` and added a runtime warning when the dataset window differs
+  from the canonical `metrics.HU_MIN/HU_MAX`.
 
-- [ ] **Pin one HU window as a single source of truth.** Import `HU_MIN/HU_MAX` from
-  config into `metrics.to_unit` defaults (or vice-versa) so training and scoring can
-  never drift apart again.
+- [x] **Pin one HU window as a single source of truth.** `metrics.py` now owns the
+  canonical window as module constants `HU_MIN/HU_MAX` (used as `to_unit` defaults);
+  `config.py` asserts its `HU_MIN/HU_MAX` equal them at import time, so any future
+  drift fails loudly instead of silently scoring in the wrong domain.
 
-## Tier 1 — Make the differences visible (evaluation/reporting, ~half day)
+## Tier 1 — Make the differences visible (evaluation/reporting, ~half day)  ✅ DONE
 
-- [ ] **Promote the discriminating metrics; demote the flat ones.**
-  In `benchmark.py` master table, mark global PSNR/SSIM/MAE as *secondary* and lead
-  with `oMAE`, `featHU`, `phase`, `prob`. Keep the identity + (add) a
-  conditional-mean-predictor row as permanent floors so every real model is read
-  against "do nothing" and "predict the average".
+- [x] **Promote the discriminating metrics; demote the flat ones.**
+  `benchmark.master_table` now carries a "How to read this table" note flagging the
+  global PSNR/SSIM/MAE/MSE/PCC columns as SECONDARY and flat by construction, and
+  points readers at the organ-region / phase / level-recovery columns as primary.
+  The `identity` floor rows already exist in the shipped tables.
 
-- [ ] **Add variance-recovery columns to the master table.** Fold the three numbers
-  `audit_enhancement.py` already computes — level-tracking **slope β**, **var_ratio**,
-  and **bias** — into `benchmark.py` as first-class per-model columns (at least for
-  aorta / portal vein / IVC / liver). These are the only columns that actually move
-  when the core problem is fixed; without them you're flying blind.
+- [x] **Add variance-recovery columns to the master table.** New **βlev** (mean
+  level-tracking slope) and **varR** (mean var(gen)/var(real)) columns, computed
+  across cases over aorta / portal vein / IVC / liver — the same quantities
+  `audit_enhancement.py` produces, folded in as first-class per-model columns.
+  Covered by `tests/test_benchmark_discovery.py::test_level_recovery`.
 
-- [ ] **Report the identifiability ceiling once.** Add a short note / oracle row: the
-  best achievable per-organ HU error given NCCT-invisible enhancement, so nobody
-  chases a floor that is data-limited, not model-limited.
+- [x] **Report the identifiability ceiling once.** The level-recovery legend states
+  that βlev/varR → 0 is indistinguishable from a conditional-mean predictor (the
+  L1/L2 fixed point under NCCT-invisible enhancement), so a low varR is read as the
+  data ceiling, not model failure. (A dedicated conditional-mean *oracle row* was not
+  added — varR itself is the collapse detector — but could be added later if wanted.)
 
 ## Tier 2 — The actual fix: stop averaging over the unknown enhancement level
 

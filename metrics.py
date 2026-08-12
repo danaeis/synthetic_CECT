@@ -63,7 +63,7 @@ import numpy as np
 
 from scipy.ndimage import gaussian_filter, binary_closing, binary_fill_holes, label
 
-__all__ = ['to_unit', 'mae', 'mse', 'psnr', 'pcc', 'ssim',
+__all__ = ['HU_MIN', 'HU_MAX', 'to_unit', 'mae', 'mse', 'psnr', 'pcc', 'ssim',
            'volume_metrics', 'masked_metrics', 'body_mask',
            'raps', 'raps_hf_ratio', 'grad_hist_distance', 'tile_starts',
            'seam_energy', 'z_flicker', 'z_flicker_anisotropy',
@@ -74,7 +74,17 @@ __all__ = ['to_unit', 'mae', 'mse', 'psnr', 'pcc', 'ssim',
 # Domain
 # ---------------------------------------------------------------------------
 
-def to_unit(vol: np.ndarray, hu_min: float = -200.0, hu_max: float = 400.0) -> np.ndarray:
+# Canonical scoring window — the single source of truth for the HU→[0,1] domain.
+# Training (dataset.py), scoring (to_unit / benchmark.py) and every script that
+# maps HU to the unit range MUST use these exact bounds, or the numbers stop being
+# comparable across models. config.HU_MIN/HU_MAX are asserted equal to these at
+# import time (see config.py), so a drift fails loudly rather than silently
+# scoring one model in a different domain than it was trained in.
+HU_MIN: float = -200.0
+HU_MAX: float =  400.0
+
+
+def to_unit(vol: np.ndarray, hu_min: float = HU_MIN, hu_max: float = HU_MAX) -> np.ndarray:
     """Clip to the HU window and rescale to [0, 1] — the shared scoring domain."""
     v = np.clip(vol.astype(np.float64), hu_min, hu_max)
     return (v - hu_min) / (hu_max - hu_min)

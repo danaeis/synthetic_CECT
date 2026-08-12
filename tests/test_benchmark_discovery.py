@@ -199,6 +199,53 @@ def test_resolve_baseline():
           B.resolve_baseline([], None) is None)
 
 
+def test_level_recovery():
+    """The two columns that separate a real generator from a conditional-mean
+    averager (variance collapse). β/varR → 1 track the case, → 0 emit the mean."""
+    print('\n_level_recovery() / _organ_medians()')
+    import math
+    import numpy as np
+
+    real = np.array([100., 120., 140., 90., 160., 110.])
+
+    perfect = B._level_recovery(real, real.copy())
+    check('perfect tracker → beta≈1, var_ratio≈1',
+          abs(perfect['beta'] - 1) < 1e-9 and abs(perfect['var_ratio'] - 1) < 1e-9,
+          f"beta={perfect['beta']:.3f} varR={perfect['var_ratio']:.3f}")
+
+    mean_pred = B._level_recovery(real, np.full_like(real, real.mean()))
+    check('constant (mean) output → beta≈0, var_ratio≈0',
+          abs(mean_pred['beta']) < 1e-9 and abs(mean_pred['var_ratio']) < 1e-9,
+          f"beta={mean_pred['beta']:.3f} varR={mean_pred['var_ratio']:.3f}")
+
+    # Aorta-like partial recovery matching analysis/enhancement.json (beta≈0.23).
+    partial = B._level_recovery(real, real.mean() + 0.23 * (real - real.mean()))
+    check('partial tracker → beta matches the injected slope',
+          abs(partial['beta'] - 0.23) < 1e-6, f"beta={partial['beta']:.4f}")
+
+    check('fewer than 3 valid cases → NaN, not a spurious slope',
+          math.isnan(B._level_recovery(np.array([1., 2.]), np.array([1., 2.]))['beta']))
+    check('NaNs dropped pairwise (n counts only complete pairs)',
+          B._level_recovery(np.array([np.nan, 1, 2, 3, 4]),
+                            np.array([1, np.nan, 2, 3, 4]))['n'] == 3)
+
+    # _organ_medians: HU medians per label, voxel floor, missing-organ NaN.
+    mask = np.zeros((8, 8, 8)); mask[0:2] = 7; mask[2:4] = 52
+    realv = np.ones((8, 8, 8)) * 100.; realv[2:4] = 130.
+    genv = np.ones((8, 8, 8)) * 98.;  genv[2:4] = 120.
+    om = B._organ_medians(realv, genv, mask,
+                          {'aorta': 7, 'inferior_vena_cava': 52, 'liver': 99})
+    check('organ medians read the right label in HU',
+          om['aorta'] == (100., 98.) and om['inferior_vena_cava'] == (130., 120.),
+          f'{om}')
+    check('organ absent from the mask → NaN pair', math.isnan(om['liver'][0]))
+    check('no organ map → empty dict (columns become NaN)',
+          B._organ_medians(realv, genv, mask, None) == {})
+    small = np.zeros((8, 8, 8)); small[0, 0, :] = 7          # 8 voxels < floor
+    check('below the voxel floor → NaN (median too noisy)',
+          math.isnan(B._organ_medians(realv, genv, small, {'aorta': 7})['aorta'][0]))
+
+
 if __name__ == '__main__':
     print('=' * 70)
     print('BENCHMARK DISCOVERY / TILING / PAIRED TESTS')
@@ -207,6 +254,7 @@ if __name__ == '__main__':
     test_read_tiling()
     test_paired_block_disjoint_cases()
     test_resolve_baseline()
+    test_level_recovery()
     print('\n' + '=' * 70)
     if FAILS:
         print(f'FAILED ({len(FAILS)}): {", ".join(FAILS)}')
