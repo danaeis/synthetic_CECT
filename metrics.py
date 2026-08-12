@@ -3,10 +3,13 @@ CT-native image-similarity metrics for the NCCT→CECT benchmark.
 
 Scope, and what is deliberately NOT here:
   * PSNR, SSIM, MAE, MSE, PCC — the standard pixel metrics the papers report.
-  * FID / LPIPS are intentionally omitted: they use ImageNet-pretrained networks
-    built for natural RGB images, so their absolute values are not meaningful on
-    grayscale CT. `benchmark.py` leaves a hook if they are ever wanted for
-    paper-comparability.
+  * FID / LPIPS are NOT here, and deliberately not in this module: they use
+    ImageNet-pretrained networks built for natural RGB images, so their absolute
+    values are not meaningful on grayscale CT and the ranking they induce is not
+    validated for this domain. They live in `perceptual.py` behind
+    `benchmark.py --perceptual`, reported for comparability with the published
+    NCCT→CECT literature and read as secondary to the CT-native texture metrics
+    below. Keeping them out of this module also keeps it numpy/scipy-only.
 
 Two conventions that make the numbers comparable across models:
   * Everything is computed on the shared HU window mapped to [0, 1] (`to_unit`),

@@ -18,6 +18,18 @@ pandas>=2.3              # labels.csv phase lookup
 matplotlib>=3.10         # patch grids / sample grids / loss curves
 tqdm>=4.67
 
+# Optional — only needed for `benchmark.py --perceptual` (LPIPS + FID, reported
+# for comparability with the published NCCT→CECT literature; see perceptual.py
+# for why they are secondary to the CT-native RAPS/gradW1 columns). Both download
+# ImageNet-pretrained weights on first use, so the scoring machine needs network
+# access once.
+lpips>=0.1.4             # ships the learned linear weights; LPIPS cannot be
+                         # reconstructed from torchvision alone
+pytorch-fid>=0.3.0       # the TF-ported InceptionV3 the FID literature is
+                         # calibrated on; without it perceptual.py falls back to
+                         # torchvision's InceptionV3, which gives DIFFERENT
+                         # numbers that must not be pooled with published ones
+
 # Optional — only needed if perceptual_backbone='dino' or saliency_mode='dino':
 timm>=1.0.22             # tier 2/3 DINO loader (DINOv3-if-available, else DINOv2)
 # transformers>=4.0      # tier 1 loader only (real DINOv3, gated HF license

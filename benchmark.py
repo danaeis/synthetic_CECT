@@ -13,6 +13,9 @@ Per case it computes, on the shared HU[-200,400]→[0,1] domain:
   * organ-region : PSNR, SSIM, MAE, MSE, PCC        (metrics.py, mask>0)
   * phase fidelity: acc-vs-target, agreement-w/-real, gen target-prob,
                     feature-L1 (HU)                  (phase_eval.PhaseEvaluator)
+  * --perceptual : LPIPS (paired, per-case) + FID (per-model, distributional)
+                   (perceptual.py) — reported for comparability with the
+                   published literature, secondary to RAPS/gradW1
 
 Each NIfTI triple is loaded once and shared between the pixel metrics and the
 phase evaluator — no double read of large volumes.
@@ -30,6 +33,10 @@ Usage:
     # or explicit models:
     python benchmark.py --weights xgb.pkl \
         --manifest ours=.../manifest.csv --manifest resvit=.../manifest.csv
+
+    # add the literature-comparability columns (needs lpips + pytorch-fid):
+    python benchmark.py --runs_dir ../out_synthesis_train --weights xgb.pkl \
+        --out analysis/benchmark_all --perceptual
 """
 
 import argparse
@@ -70,12 +77,31 @@ def _phase_id(v) -> int:
 def read_tiling(manifest: Path) -> Dict:
     """Patch geometry from the run's own run_config.json, for the seam metric.
 
-    `<run>/phase_infer/manifest.csv` → `<run>/run_config.json`. Returns {} for
-    models that were not produced by this pipeline (external baselines, whole-slice
-    models) — the seam metric is then reported as NaN rather than as a wrong
-    number computed against a tiling that never happened.
+    `<run>/phase_infer/manifest.csv` → `<run>/run_config.json`, and
+    `<run>/phase_infer/<phase>/manifest.csv` → the same file one level further up.
+    The config is located by walking UP rather than by a fixed `parent.parent`,
+    which was correct only for the flat layout: for a multi-phase run it resolved
+    to `<run>/phase_infer/`, found nothing, and returned {} — so seam came out NaN
+    for exactly those runs and read as "no tiling geometry" rather than as a bug.
+
+    Returns {} for models that genuinely were not produced by this pipeline
+    (external baselines, whole-slice models) — the seam metric is then reported as
+    NaN rather than as a wrong number computed against a tiling that never
+    happened.
+
+    Anchored on the `phase_infer/` directory rather than on a depth count, because
+    the two layouts sit at different depths and no single count is right for both.
+    A plain "walk up until a run_config.json turns up" is worse still: for a model
+    that genuinely has none it would keep climbing into the runs_dir and score the
+    seam against some unrelated run's patch geometry — a wrong number where NaN is
+    the correct answer.
+
+    Falls back to the historical `parent.parent` for an output directory not named
+    `phase_infer` (infer_volume.py's --out_dir is free-form).
     """
-    cfg_path = manifest.parent.parent / 'run_config.json'
+    anchor = next((q for q in manifest.parents if q.name == 'phase_infer'), None)
+    cfg_path = ((anchor.parent if anchor else manifest.parent.parent)
+                / 'run_config.json')
     if not cfg_path.exists():
         return {}
     try:
@@ -89,8 +115,13 @@ def read_tiling(manifest: Path) -> Dict:
 
 def score_model(name: str, manifest: Path, ev: PhaseEvaluator,
                 hu_min: float, hu_max: float, gen_in_hu: bool,
-                tiling: Optional[Dict] = None) -> List[Dict]:
-    """Full per-case metric rows for one model."""
+                tiling: Optional[Dict] = None, scorer=None) -> List[Dict]:
+    """Full per-case metric rows for one model.
+
+    `scorer` is an optional `perceptual.PerceptualScorer`: when present each case
+    also contributes its slices to this model's FID accumulator and returns a
+    per-case LPIPS. Without it both columns are NaN and no torch is imported.
+    """
     tiling = tiling or {}
     rows = []
     with manifest.open() as f:
@@ -128,6 +159,12 @@ def score_model(name: str, manifest: Path, ev: PhaseEvaluator,
         cs = M.consistency_metrics(g01, r01, tiling.get('patch_size'),
                                    tiling.get('overlap'))
 
+        # FID / LPIPS: comparability-only, ImageNet-pretrained, opt-in. Scored on
+        # the same [0,1] domain and the same body-mask slice selection as above —
+        # see perceptual.py for why they are secondary to RAPS/gradW1.
+        lp = (scorer.add_case(name, c['real_path'], g01, r01, bmask)
+              if scorer is not None else float('nan'))
+
         # Phase fidelity: the evaluator handles HU internally.
         ph = ev.score_case(gen, real, mask, tp, hu_min=hu_min, hu_max=hu_max,
                             gen_in_hu=gen_in_hu)
@@ -147,6 +184,7 @@ def score_model(name: str, manifest: Path, ev: PhaseEvaluator,
             'body_frac': float(bmask.mean()),
             **tx,          # raps_hf, grad_w1, org_grad_w1
             **cs,          # seam, zflicker
+            'lpips': lp,
             'phase_match': int(ph['gen_matches_target']),
             'agree_real': int(ph['gen_matches_real']),
             'gen_prob': ph['gen_target_prob'],
@@ -170,7 +208,8 @@ def summarise(name: str, rows: List[Dict]) -> Dict:
     pixel = ['psnr', 'ssim', 'mae', 'mse', 'pcc',
              'org_psnr', 'org_ssim', 'org_mae', 'org_mse', 'org_pcc',
              'body_psnr', 'body_ssim', 'body_mae', 'body_frac',
-             'raps_hf', 'grad_w1', 'org_grad_w1', 'seam', 'zflicker', 'zaniso']
+             'raps_hf', 'grad_w1', 'org_grad_w1', 'seam', 'zflicker', 'zaniso',
+             'lpips']
     out = {'model': name, 'n': len(rows)}
     for k in pixel:
         out[k] = _nanmean([r.get(k) for r in rows])
@@ -227,18 +266,39 @@ PAIRED_METRICS = [
     ('zaniso',        True,  _dev1, '|zaniso-1|'),
 ]
 
+# Appended only under --perceptual. LPIPS is paired and per-case so it fits here;
+# FID is a per-model distributional score with no per-case value and therefore has
+# no paired test at all — that is a property of the metric, not an omission.
+LPIPS_PAIRED = [('lpips', True, None, 'lpips')]
 
-def paired_block(all_rows: Dict[str, List[Dict]], base: str, out: List[str]):
+
+def paired_block(all_rows: Dict[str, List[Dict]], base: str, out: List[str],
+                 metrics=None):
     out.append(f'\n## Paired per-case tests vs "{base}"  (negative = better)')
+    metrics = PAIRED_METRICS if metrics is None else metrics
     br = {r['_key']: r for r in all_rows[base]}
-    out.append(f"\n{'model':16s}{'metric':16s}{'delta':>10}{'t':>8}{'sig':>5}{'better':>9}")
+    # A fixed 26-char model column silently ran into the metric column for the
+    # `<run>/<phase>` names ('multiphase_film_adv_slices11/venous' is 35), which
+    # printed as 'multiphase_film_adv/venousfeature_l1_hu'. Size it to the data.
+    mw = max(26, max(len(n) for n in all_rows) + 2)
+    out.append(f"\n{'model':{mw}s}{'metric':16s}{'delta':>10}{'t':>8}{'sig':>5}{'better':>9}")
     for name, rows in all_rows.items():
         if name == base:
             continue
         rr = {r['_key']: r for r in rows}
         common = [c for c in br if c in rr]
+        if not common:
+            # No shared cases — e.g. an arterial arm against a venous baseline,
+            # where `_key` is the real CECT path and the two never coincide.
+            # paired_t([]) returns (0.0, 0.0, 0), so without this the block would
+            # print a full set of '+0.000 ns' rows that read as "identical to the
+            # baseline" when nothing was actually compared.
+            out.append(f'{name:{mw}s}— no cases in common with the baseline; '
+                       f'not comparable')
+            out.append('')
+            continue
         first = True
-        for metric, better_is_low, tf, label in PAIRED_METRICS:
+        for metric, better_is_low, tf, label in metrics:
             d = []
             for c in common:
                 a, b = br[c].get(metric), rr[c].get(metric)
@@ -248,7 +308,7 @@ def paired_block(all_rows: Dict[str, List[Dict]], base: str, out: List[str]):
                     a, b = tf(a), tf(b)
                 d.append((b - a) if better_is_low else (a - b))   # sign: neg = better
             m, t, w = paired_t(d)
-            out.append(f"{(name if first else ''):16s}{label:16s}"
+            out.append(f"{(name if first else ''):{mw}s}{label:16s}"
                        f"{m:+10.3f}  {t:+8.2f}  {sig(t):>4}{w:>5}/{len(d)}")
             first = False
         out.append('')
@@ -260,7 +320,8 @@ def paired_block(all_rows: Dict[str, List[Dict]], base: str, out: List[str]):
 # Table
 # ---------------------------------------------------------------------------
 
-def master_table(summaries: List[Dict], out: List[str]):
+def master_table(summaries: List[Dict], out: List[str], perceptual: bool = False,
+                 fid_backend: Optional[str] = None, lpips_net: str = 'alex'):
     out.append('# NCCT→CECT benchmark — master table\n')
     out.append('All metrics on the shared HU[-200,400]→[0,1] domain, same test cases.\n')
     cols = [('n', 'n', '{:d}'), ('psnr', 'PSNR', '{:.2f}'), ('ssim', 'SSIM', '{:.4f}'),
@@ -275,6 +336,8 @@ def master_table(summaries: List[Dict], out: List[str]):
             ('org_grad_w1', 'oGradW1', '{:.4f}'),
             ('seam', 'seam', '{:.3f}'), ('zflicker', 'zflick', '{:.3f}'),
             ('zaniso', 'zaniso', '{:.3f}')]
+    if perceptual:
+        cols += [('lpips', 'LPIPS', '{:.4f}'), ('fid', 'FID', '{:.1f}')]
     out.append('| model | ' + ' | '.join(h for _, h, _ in cols) + ' |')
     out.append('|' + '---|' * (len(cols) + 1))
     for s in summaries:
@@ -296,6 +359,21 @@ def master_table(summaries: List[Dict], out: List[str]):
                'texture. seam > 1 is a visible tile boundary; zflick > 1 is '
                'slice-to-slice flicker. gradW1 is a distance: lower is better. '
                'seam is NaN for models with no known tiling geometry.')
+    if perceptual:
+        n_sl = _nanmean([s.get('fid_n_slices') for s in summaries])
+        out.append(
+            f'\n**LPIPS / FID** (`perceptual.py`) — reported for comparability with the '
+            f'published NCCT→CECT literature, **not** as primary evidence. Both run '
+            f'ImageNet-pretrained networks on grayscale CT, so their absolute values '
+            f'have no physical meaning here and their ordering is not validated for '
+            f'this domain; the CT-native RAPS/gradW1 columns are what the texture '
+            f'claims rest on. LPIPS ({lpips_net}) is paired and per-case, lower is '
+            f'better, computed at native in-plane resolution. FID is distributional: '
+            f'one value per model over ~{n_sl:.0f} pooled body-containing axial slices '
+            f'from n=20 volumes, so it has no per-case value and no paired test. **FID '
+            f'is biased upward at small sample size** — these values are comparable '
+            f'between the rows of this table (identical slice counts, identical real '
+            f'set) and to nothing else. Backend: {fid_backend}.')
     out.append('\n**Caveat:** external models retrained on this data at this scale do not '
                'reproduce their papers\' reported numbers — this is a controlled same-data, '
                'same-split comparison, not a reproduction. PSNR/SSIM reward blur here (see '
@@ -305,12 +383,64 @@ def master_table(summaries: List[Dict], out: List[str]):
 # ---------------------------------------------------------------------------
 
 def discover(runs_dir: Path) -> Dict[str, Path]:
-    found = {}
+    """Trained runs that also have a manifest, i.e. have been through infer_volume.py.
+
+    A run with a checkpoint but no manifest is reported rather than silently
+    dropped: that is a missing inference step, not an absent model, and it is
+    invisible in the output table otherwise.
+    """
+    found, pending = {}, []
     for d in sorted(runs_dir.iterdir()):
-        m = d / 'phase_infer' / 'manifest.csv'
-        if m.exists():
-            found[d.name.replace('literature_baseline_', '')] = m
+        if not d.is_dir():
+            continue
+        name = d.name.replace('literature_baseline_', '')
+        pi = d / 'phase_infer'
+        if (pi / 'manifest.csv').exists():
+            found[name] = pi / 'manifest.csv'
+            continue
+        # MULTI-PHASE runs write one manifest per phase SUBDIRECTORY
+        # (infer_volume.py: a multi-phase model emits several volumes per case,
+        # which would collide on '{case_id}_syn.nii.gz' in a single directory).
+        # Looking only for the flat manifest silently skipped those runs
+        # entirely — they were absent from the table rather than reported.
+        #
+        # Each phase becomes its OWN model row, `<run>/<phase>`. They must not be
+        # pooled: an arterial and a venous volume are different targets, and
+        # averaging their featHU would make the multi-phase arms incomparable to
+        # every single-phase run, which is the whole point of the M1/M2/M3 design.
+        per_phase = sorted(pi.glob('*/manifest.csv')) if pi.is_dir() else []
+        if per_phase:
+            for m in per_phase:
+                found[f'{name}/{m.parent.name}'] = m
+            continue
+        if (d / 'best_model.pth').exists():
+            pending.append(d.name)
+    if pending:
+        print(f'  [discover] {len(pending)} trained run(s) have no '
+              f'phase_infer/manifest.csv and are NOT scored — run infer_volume.py '
+              f'on them first: {", ".join(pending)}')
     return found
+
+
+def resolve_baseline(names, requested: str | None):
+    """Map a `--baseline` spelling onto a model name, or None if it matches none.
+
+    discover() strips the `literature_baseline_` prefix, so a baseline given as a
+    run DIRECTORY name would silently never match. Accept either spelling. With
+    no request, fall back to the L1-only reference arm.
+    """
+    names = list(names)
+    if not requested:
+        # 'l1_only' is the reference arm. Matching any *only* name sorted first
+        # picked `l1_huprofile_only` — an ablation, and the weakest level model in
+        # the table — as the silent default for a whole paired report.
+        return next((n for n in names if n in ('l1_only', 'literature_baseline_l1_only')),
+                    next((n for n in names if 'only' in n), next(iter(names), None)))
+    for cand in (requested, requested.replace('literature_baseline_', ''),
+                 f'literature_baseline_{requested}'):
+        if cand in names:
+            return cand
+    return None
 
 
 def main():
@@ -331,6 +461,22 @@ def main():
     ap.add_argument('--gen_not_hu', action='store_true',
                     help='generated volumes are NOT already in HU (default: they are)')
     ap.add_argument('--out', type=Path, default=Path('analysis/benchmark'))
+    ap.add_argument('--perceptual', action='store_true',
+                    help='also report LPIPS (paired, per-case) and FID (per-model) '
+                         'for comparability with the published literature. Needs '
+                         'torch + `lpips` + `pytorch-fid`; see perceptual.py for why '
+                         'these are secondary to the RAPS/gradW1 columns.')
+    ap.add_argument('--lpips_net', default='alex', choices=['alex', 'vgg', 'squeeze'],
+                    help="LPIPS backbone (default alex, the variant papers report)")
+    ap.add_argument('--perceptual_device', default=None,
+                    help='torch device for FID/LPIPS (default: cuda if available)')
+    ap.add_argument('--min_body_frac', type=float, default=0.02,
+                    help='skip axial slices whose body mask covers less than this '
+                         'fraction of the frame; near-empty air slices are identical '
+                         'in gen and real and drag every model\'s FID toward 0')
+    ap.add_argument('--max_slices_per_case', type=int, default=None,
+                    help='evenly subsample at most this many slices per case '
+                         '(speed/memory); default uses every qualifying slice')
     args = ap.parse_args()
 
     manifests: Dict[str, Path] = {}
@@ -341,6 +487,15 @@ def main():
         manifests[name] = Path(path)
     if not manifests:
         raise SystemExit('no manifests — pass --runs_dir or --manifest name=path.csv')
+
+    # Check the baseline name BEFORE scoring: it costs seconds to catch a typo
+    # here and ~an hour of volume scoring to catch it after the loop, where the
+    # results were then discarded unwritten.
+    if args.baseline and resolve_baseline(manifests, args.baseline) is None:
+        raise SystemExit(f'--baseline {args.baseline!r} is not one of the models to be '
+                         f'scored: ' + ', '.join(manifests) +
+                         '\n(pass its manifest too: --manifest '
+                         f'{args.baseline}=<path>/manifest.csv, or --runs_dir)')
 
     organ_map = None
     if args.organ_map and args.organ_map.exists():
@@ -353,6 +508,24 @@ def main():
             organ_map = None    # incomplete → let PhaseEvaluator fall back to TS
     ev = PhaseEvaluator(args.weights, organ_label_map=organ_map)
     gen_in_hu = not args.gen_not_hu
+
+    # Built BEFORE the scoring loop so a missing torch/lpips/pytorch-fid fails in
+    # seconds rather than after an hour of volume scoring. A hard exit, not a
+    # warning: --perceptual was asked for explicitly, and silently writing a table
+    # without the columns it was run for is the worse failure.
+    scorer = None
+    if args.perceptual:
+        from perceptual import PerceptualScorer, PerceptualUnavailable
+        try:
+            scorer = PerceptualScorer(device=args.perceptual_device,
+                                      lpips_net=args.lpips_net,
+                                      min_body_frac=args.min_body_frac,
+                                      max_slices_per_case=args.max_slices_per_case)
+        except PerceptualUnavailable as e:
+            raise SystemExit(f'--perceptual: {e}')
+        print(f'  [perceptual] device={scorer.device} lpips={args.lpips_net} '
+              f'fid_backend={scorer.fid_backend}')
+
     print(f'Scoring {len(manifests)} models: {", ".join(manifests)}')
 
     all_rows, summaries = {}, []
@@ -361,21 +534,41 @@ def main():
             print(f'  [{name}] manifest missing: {mpath} — skipped')
             continue
         rows = score_model(name, mpath, ev, args.hu_min, args.hu_max, gen_in_hu,
-                           tiling=read_tiling(mpath))
+                           tiling=read_tiling(mpath), scorer=scorer)
         if not rows:
             print(f'  [{name}] no scored cases — skipped')
             continue
         all_rows[name] = rows
         summaries.append(summarise(name, rows))
+        if scorer is not None:
+            # FID is distributional, so it exists only once every case of this
+            # model has been accumulated — it cannot come out of summarise().
+            summaries[-1]['fid'] = scorer.fid(name)
+            summaries[-1]['fid_n_slices'] = scorer.n_slices(name)
         s = summaries[-1]
         print(f'  [{name}] n={s["n"]} PSNR {s["psnr"]:.2f} oSSIM {s["org_ssim"]:.4f} '
               f'featHU {s["feature_l1_hu"]:.2f}')
 
+    if not all_rows:
+        raise SystemExit('no model produced scored cases — nothing to report')
+
     lines: List[str] = []
-    master_table(summaries, lines)
-    base = args.baseline or next((n for n in all_rows if 'only' in n), next(iter(all_rows)))
-    if base in all_rows and len(all_rows) > 1:
-        paired_block(all_rows, base, lines)
+    master_table(summaries, lines, perceptual=scorer is not None,
+                 fid_backend=(scorer.fid_backend if scorer else None),
+                 lpips_net=args.lpips_net)
+    # A missing paired block is a note in the report, never a hard exit: the
+    # per-model scoring is the expensive part and stays worth writing out.
+    base = resolve_baseline(all_rows, args.baseline)
+    if len(all_rows) < 2:
+        lines.append(f'\n_Only one model scored ({next(iter(all_rows))}) — paired tests '
+                     'need at least two, so none were run._')
+    elif base is None:
+        lines.append(f'\n_Baseline {args.baseline!r} scored no cases — paired tests '
+                     'skipped._')
+    else:
+        paired_block(all_rows, base, lines,
+                     metrics=(PAIRED_METRICS + LPIPS_PAIRED if scorer is not None
+                              else PAIRED_METRICS))
     report = '\n'.join(lines)
     print('\n' + report)
 

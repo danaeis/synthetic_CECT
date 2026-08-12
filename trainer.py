@@ -238,10 +238,22 @@ class Trainer:
             'val_org_mae', 'val_org_psnr', 'val_org_ssim', 'val_org_ncc',  # organ-region
         ] + ([
             # Mean |gamma| per FiLM site. This is a RESULT, not diagnostics: if
-            # gamma converges to ~0 the decoder learned to ignore the phase
-            # input, i.e. conditioning bought nothing.
+            # gamma converges to ~0 the decoder learned to ignore the
+            # conditioning, i.e. conditioning bought nothing.
+            #
+            # Gated on EITHER conditioning source, not just phase. `film_stats()`
+            # reports gammas whenever UNetGenerator.use_cond is set, which is
+            # `use_phase_cond or n_levels`, and n_levels comes from cond_organs
+            # (see the generator construction below). Keying this off
+            # use_phase_cond alone meant the level-only arms (level_aorta,
+            # level_aorta_pv, level_all8) allocated no gamma_* history slots, and
+            # `_update_history`'s `if k in h` guard then dropped every value
+            # silently — so the one measurement that says whether the decoder
+            # used the level input was missing from exactly the runs that exist
+            # to answer that question.
             f'gamma_{s}' for s in ('bottleneck', 'dec4', 'dec3', 'dec2', 'dec1')
-        ] if config.get('use_phase_cond', False) else [])}
+        ] if (config.get('use_phase_cond', False)
+              or config.get('cond_organs')) else [])}
 
         # Per-organ metrics: id→name map (from the CTPhase-XGBoost dump so organ
         # names match that phase model). Missing/unset → per-organ reported by
