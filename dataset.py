@@ -302,9 +302,24 @@ class CTPairDataset(Dataset):
         self.min_mean = cfg.get('min_patch_mean', -800.0)
         self.min_max  = cfg.get('min_patch_max',  -500.0)
 
-        # Normalisation
+        # Normalisation. Defaults MUST equal the canonical scoring window
+        # (metrics.HU_MIN/HU_MAX = -200/400): a stale 300 ceiling here trained
+        # models in a narrower domain than the benchmark scores them in, and the
+        # mismatch was invisible because config.py always passes the full window.
+        # The fallback is the safety net for any caller that builds the dataset
+        # without going through config; the guard below makes a drift loud.
         self.hu_min = float(cfg.get('hu_min', -200))
-        self.hu_max = float(cfg.get('hu_max',  300))
+        self.hu_max = float(cfg.get('hu_max',  400))
+        try:
+            import metrics as _M
+            if (self.hu_min, self.hu_max) != (_M.HU_MIN, _M.HU_MAX):
+                log.warning(
+                    "HU window (%.0f,%.0f) differs from the canonical scoring "
+                    "window (%.0f,%.0f) in metrics.py — models trained here will "
+                    "be scored in a different domain and are not comparable.",
+                    self.hu_min, self.hu_max, _M.HU_MIN, _M.HU_MAX)
+        except ImportError:
+            pass
 
         # Organ-focused sampling: bias a fraction of patch centres onto organ/
         # vessel voxels so patches actually CONTAIN the structures the organ and

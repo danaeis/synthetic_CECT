@@ -199,6 +199,127 @@ def test_resolve_baseline():
           B.resolve_baseline([], None) is None)
 
 
+def test_level_recovery():
+    """The two columns that separate a real generator from a conditional-mean
+    averager (variance collapse). β/varR → 1 track the case, → 0 emit the mean."""
+    print('\n_level_recovery() / _organ_medians()')
+    import math
+    import numpy as np
+
+    real = np.array([100., 120., 140., 90., 160., 110.])
+
+    perfect = B._level_recovery(real, real.copy())
+    check('perfect tracker → beta≈1, var_ratio≈1',
+          abs(perfect['beta'] - 1) < 1e-9 and abs(perfect['var_ratio'] - 1) < 1e-9,
+          f"beta={perfect['beta']:.3f} varR={perfect['var_ratio']:.3f}")
+
+    mean_pred = B._level_recovery(real, np.full_like(real, real.mean()))
+    check('constant (mean) output → beta≈0, var_ratio≈0',
+          abs(mean_pred['beta']) < 1e-9 and abs(mean_pred['var_ratio']) < 1e-9,
+          f"beta={mean_pred['beta']:.3f} varR={mean_pred['var_ratio']:.3f}")
+
+    # Aorta-like partial recovery matching analysis/enhancement.json (beta≈0.23).
+    partial = B._level_recovery(real, real.mean() + 0.23 * (real - real.mean()))
+    check('partial tracker → beta matches the injected slope',
+          abs(partial['beta'] - 0.23) < 1e-6, f"beta={partial['beta']:.4f}")
+
+    check('fewer than 3 valid cases → NaN, not a spurious slope',
+          math.isnan(B._level_recovery(np.array([1., 2.]), np.array([1., 2.]))['beta']))
+    check('NaNs dropped pairwise (n counts only complete pairs)',
+          B._level_recovery(np.array([np.nan, 1, 2, 3, 4]),
+                            np.array([1, np.nan, 2, 3, 4]))['n'] == 3)
+
+    # _organ_medians: HU medians per label, voxel floor, missing-organ NaN.
+    mask = np.zeros((8, 8, 8)); mask[0:2] = 7; mask[2:4] = 52
+    realv = np.ones((8, 8, 8)) * 100.; realv[2:4] = 130.
+    genv = np.ones((8, 8, 8)) * 98.;  genv[2:4] = 120.
+    om = B._organ_medians(realv, genv, mask,
+                          {'aorta': 7, 'inferior_vena_cava': 52, 'liver': 99})
+    check('organ medians read the right label in HU',
+          om['aorta'] == (100., 98.) and om['inferior_vena_cava'] == (130., 120.),
+          f'{om}')
+    check('organ absent from the mask → NaN pair', math.isnan(om['liver'][0]))
+    check('no organ map → empty dict (columns become NaN)',
+          B._organ_medians(realv, genv, mask, None) == {})
+    small = np.zeros((8, 8, 8)); small[0, 0, :] = 7          # 8 voxels < floor
+    check('below the voxel floor → NaN (median too noisy)',
+          math.isnan(B._organ_medians(realv, genv, small, {'aorta': 7})['aorta'][0]))
+
+
+def _summ(name, **kw):
+    base = dict(model=name, n=20, psnr=30.0, ssim=0.94, mae=0.01, mse=0.001, pcc=0.98,
+                org_psnr=24.5, org_ssim=0.96, org_mae=0.03, body_psnr=25.5,
+                body_mae=0.028, body_frac=0.32, phase_acc=1.0, gen_prob=0.98,
+                feature_l1_hu=14.0, lev_beta=0.3, lev_varr=0.2, raps_hf=0.84,
+                grad_w1=0.002, org_grad_w1=0.006, seam=1.36, zflicker=0.9,
+                zaniso=1.05, lpips=float('nan'), fid=float('nan'))
+    base.update(kw)
+    return base
+
+
+def test_model_family():
+    print('\nmodel_family()')
+    check('this-repo GAN default', B.model_family('l1_organ_groupnorm_s43')
+          == 'UNet + PatchGAN (this repo)')
+    check('diffusion by prefix', B.model_family('diff_hetero_nll') == 'Diffusion')
+    check('external baseline by name', B.model_family('pix2pixhd_baseline')
+          == 'External baseline')
+    check('identity is reference/floor', B.model_family('identity_venous')
+          == 'Reference / floor')
+    # A multi-phase arm keeps its family after the '/phase' suffix is stripped.
+    check('phase arm classified by its base run', B.model_family('diff_v/arterial')
+          == 'Diffusion')
+
+
+def test_rank_marks():
+    print('\n_rank_marks() best/second, direction-aware, floors excluded')
+    summ = [_summ('a', psnr=30.0, org_mae=0.030, lev_beta=0.30, raps_hf=0.84),
+            _summ('b', psnr=30.8, org_mae=0.028, lev_beta=0.95, raps_hf=1.20),
+            _summ('c', psnr=30.5, org_mae=0.029, lev_beta=0.50, raps_hf=0.90),
+            _summ('identity_x', psnr=27.0, org_mae=0.055, lev_beta=0.0, raps_hf=1.36)]
+
+    hi = B._rank_marks(summ, 'psnr', 'high')
+    check('higher-better: best=max, second=next', hi.get('b') == 'best' and hi.get('c') == 'second')
+    lo = B._rank_marks(summ, 'org_mae', 'low')
+    check('lower-better: best=min, second=next', lo.get('b') == 'best' and lo.get('c') == 'second')
+    one = B._rank_marks(summ, 'lev_beta', 'one')
+    check('target-1: best=closest to 1 (0.95), second=0.50',
+          one.get('b') == 'best' and one.get('c') == 'second')
+    r1 = B._rank_marks(summ, 'raps_hf', 'one')
+    check('target-1 both sides: 0.90 beats 0.84 and 1.20', r1.get('c') == 'best',
+          f'{r1}')
+    check('reference/floor never marked',
+          all('identity_x' not in m for m in (hi, lo, one, r1)))
+    check("unranked column (dir None) → no marks", B._rank_marks(summ, 'n', None) == {})
+
+
+def test_master_table_categorised():
+    print('\nmaster_table() categorised + highlighted')
+    summ = [_summ('l1_only', psnr=30.4, feature_l1_hu=17.0),
+            _summ('diff_hetero_nll', psnr=30.8, feature_l1_hu=13.0),
+            _summ('identity_venous', psnr=27.5, feature_l1_hu=56.0)]
+    out = []
+    B.master_table(summ, out, perceptual=False)
+    txt = '\n'.join(out)
+    for cat in ('Image-level', 'Organ-level', 'Phase & level fidelity',
+                'Detail-focused', 'Perceptual'):
+        check(f'category present: {cat}', cat in txt)
+    check('architecture family headers present',
+          'UNet + PatchGAN (this repo)' in txt and 'Diffusion' in txt
+          and 'Reference / floor' in txt)
+    check('best featHU (diff, 13.0) is bolded', '**13.00**' in txt)
+    check('floor row not bolded on PSNR', '**27.5' not in txt and '_27.5' not in txt)
+    check('perceptual OFF → note, no LPIPS table row', 'Re-run `benchmark.py --perceptual`' in txt)
+    # With perceptual on, the LPIPS/FID table renders instead of the note.
+    out2 = []
+    B.master_table([_summ('l1_only', lpips=0.24, fid=55.0),
+                    _summ('diff_hetero_nll', lpips=0.19, fid=38.0)],
+                   out2, perceptual=True, fid_backend='pytorch-fid')
+    t2 = '\n'.join(out2)
+    check('perceptual ON → LPIPS/FID column + best bolded',
+          '| LPIPS | FID |' in t2 and '**0.1900**' in t2)
+
+
 if __name__ == '__main__':
     print('=' * 70)
     print('BENCHMARK DISCOVERY / TILING / PAIRED TESTS')
@@ -207,6 +328,10 @@ if __name__ == '__main__':
     test_read_tiling()
     test_paired_block_disjoint_cases()
     test_resolve_baseline()
+    test_level_recovery()
+    test_model_family()
+    test_rank_marks()
+    test_master_table_categorised()
     print('\n' + '=' * 70)
     if FAILS:
         print(f'FAILED ({len(FAILS)}): {", ".join(FAILS)}')
