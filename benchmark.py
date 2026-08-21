@@ -268,7 +268,20 @@ def score_model(name: str, manifest: Path, ev: PhaseEvaluator,
             # ground-truth file), and unique per case. Neither the gen basename
             # (models may reuse gen.nii.gz per case dir) nor the real basename
             # (per-case dirs can repeat it) is safe as the key.
-            '_key': c['real_path'],
+            #
+            # Resolved to an absolute path: different adapters' manifests spell
+            # the SAME file differently (one repo's manifest.csv had
+            # `../sample_data_reg/...`, another's had `/media/.../sample_data_reg/
+            # ...` for the identical case), and raw-string equality then silently
+            # finds zero cases in common — the exact failure mode
+            # `paired_block`'s "no cases in common" message is also supposed to
+            # catch for a genuinely different phase arm, so an unresolved path
+            # made that message lie about which case it was. Resolution assumes
+            # every manifest is read from a consistent cwd (`cd synthetic_CECT`
+            # before running, as every RUN_*.md documents) so a relative path
+            # resolves onto the same absolute file a sibling repo already wrote
+            # in absolute form.
+            '_key': str(Path(c['real_path']).resolve()),
             'case': Path(c['real_path']).name,
             **{f'{k}': vm[k] for k in ('psnr', 'ssim', 'mae', 'mse', 'pcc')},
             **{f'org_{k}': om[k] for k in ('psnr', 'ssim', 'mae', 'mse', 'pcc')},
@@ -524,16 +537,34 @@ FAMILY_ORDER = ['UNet + PatchGAN (this repo)', 'Diffusion',
                 'External baseline', 'Reference / floor']
 
 
+# Keyword -> every vendored competing-model repo in ../bench_ncct2cect/BENCHMARK.md
+# that trains and infers through ITS OWN pipeline (not our backbone_common.py/
+# train_backbone.py trainer). SwinUNETR and TransUNet are deliberately absent:
+# they use OUR trainer/objective on OUR architecture-only vendoring, so they
+# belong in "UNet + PatchGAN (this repo)" alongside the ablations, matching
+# BENCHMARK.md's own framing of them as an architecture swap, not an external
+# pipeline. Extend this set — do not rename it away — the next time a new
+# external repo is scored, or it silently lands in "this repo"'s section.
+_EXTERNAL_KEYWORDS = ('pix2pixhd', 'resvit', 'resnet', 'cyclegan', 'gan_ext',
+                      'cytran', 'syndiff')
+
+
 def model_family(name: str) -> str:
     """Bucket a model/run name into its generator architecture. Heuristic on the
     run-name convention (the phase arm after '/' is stripped first)."""
     base = name.split('/')[0].lower()
     if base.startswith('identity'):
         return 'Reference / floor'
+    # External check BEFORE the diffusion check: SynDiff is both (an external
+    # repo whose model happens to be a diffusion architecture), and "External
+    # baseline" is the more useful bucket here — it keeps that section as
+    # "everything not trained by our infra" rather than splitting SynDiff away
+    # from ResViT/CyTran/CycleGAN into a section otherwise reserved for our own
+    # diffusion ablations, which would misleadingly suggest it's our own work.
+    if any(k in base for k in _EXTERNAL_KEYWORDS):
+        return 'External baseline'
     if base.startswith('diff'):
         return 'Diffusion'
-    if any(k in base for k in ('pix2pixhd', 'resvit', 'resnet', 'cyclegan', 'gan_ext')):
-        return 'External baseline'
     return 'UNet + PatchGAN (this repo)'
 
 
@@ -613,7 +644,8 @@ def _category_table(title: str, specs, summaries: List[Dict], out: List[str]):
 
 
 def master_table(summaries: List[Dict], out: List[str], perceptual: bool = False,
-                 fid_backend: Optional[str] = None, lpips_net: str = 'alex'):
+                 fid_backend: Optional[str] = None, lpips_net: str = 'alex',
+                 radimagenet: bool = False, radimagenet_backend: Optional[str] = None):
     out.append('# NCCT→CECT benchmark — master table\n')
     out.append('All metrics on the shared HU[-200,400]→[0,1] domain, same test cases. '
                'Metrics are split into categories (one table each); models are grouped '
@@ -631,6 +663,11 @@ def master_table(summaries: List[Dict], out: List[str], perceptual: bool = False
                            'FID; they are comparability-only and secondary to the '
                            'CT-native RAPS/gradW1 columns above._')
                 continue
+            # fid_rad is appended only when it was actually computed for at least
+            # one model — an all-blank column for reports that never passed
+            # --radimagenet_weights is noise, not information.
+            if radimagenet:
+                specs = specs + [('fid_rad', 'FID(Rad)', '{:.1f}', 'low')]
         _category_table(title, specs, summaries, out)
 
     out.append('\n**Spread.** Every cell is `mean ± sd` **across the n test cases**, sample '
@@ -693,6 +730,20 @@ def master_table(summaries: List[Dict], out: List[str], perceptual: bool = False
             f'is biased upward at small sample size** — these values are comparable '
             f'between the rows of this table (identical slice counts, identical real '
             f'set) and to nothing else. Backend: {fid_backend}.')
+    if radimagenet:
+        out.append(
+            f'\n**FID(Rad)** (`perceptual.py`) — the same distributional FID, from a '
+            f'ResNet50 pretrained on RadImageNet (radiology images) instead of '
+            f'ImageNet photographs, reported because the NCCT→CECT literature '
+            f'increasingly does. It is a DIFFERENT quantity from **FID** above — '
+            f'never rank or difference the two columns against each other. Reported '
+            f'evidence is mixed on whether this backbone is actually more valid for '
+            f'medical-image FID than ImageNet\'s: Woodland et al. 2024 ("Feature '
+            f'Extraction for Generative Medical Imaging Evaluation") found '
+            f'RadImageNet-based FID rankings were MORE volatile and LESS aligned '
+            f'with human judgment than ImageNet-based ones in their tests. Treat '
+            f'FID(Rad) as one more comparability column, not a more-trustworthy '
+            f'replacement for FID or for RAPS/gradW1. Backend: {radimagenet_backend}.')
     out.append('\n**Caveat:** external models retrained on this data at this scale do not '
                'reproduce their papers\' reported numbers — this is a controlled same-data, '
                'same-split comparison, not a reproduction. PSNR/SSIM reward blur here (see '
@@ -927,6 +978,15 @@ def main():
                     help="LPIPS backbone (default alex, the variant papers report)")
     ap.add_argument('--perceptual_device', default=None,
                     help='torch device for FID/LPIPS (default: cuda if available)')
+    ap.add_argument('--radimagenet_weights', type=Path, default=None,
+                    help='path to a local RadImageNet ResNet50 PyTorch state_dict '
+                         '(.pt/.pth); adds a second, RadImageNet-backbone FID '
+                         'column (fid_rad) alongside the ImageNet one. Requires '
+                         '--perceptual. See perceptual.py module docstring for '
+                         'where to get the weights and the caveat on how much '
+                         'this backbone is actually validated for FID. No '
+                         'RadImageNet-LPIPS is computed (no published linear '
+                         'calibration for that backbone).')
     ap.add_argument('--min_body_frac', type=float, default=0.02,
                     help='skip axial slices whose body mask covers less than this '
                          'fraction of the frame; near-empty air slices are identical '
@@ -1009,6 +1069,10 @@ def main():
     # seconds rather than after an hour of volume scoring. A hard exit, not a
     # warning: --perceptual was asked for explicitly, and silently writing a table
     # without the columns it was run for is the worse failure.
+    if args.radimagenet_weights and not args.perceptual:
+        raise SystemExit('--radimagenet_weights needs --perceptual (it extends '
+                         'the same FID/LPIPS pass, not a standalone one)')
+
     scorer = None
     if args.perceptual:
         from perceptual import PerceptualScorer, PerceptualUnavailable
@@ -1016,11 +1080,14 @@ def main():
             scorer = PerceptualScorer(device=args.perceptual_device,
                                       lpips_net=args.lpips_net,
                                       min_body_frac=args.min_body_frac,
-                                      max_slices_per_case=args.max_slices_per_case)
+                                      max_slices_per_case=args.max_slices_per_case,
+                                      radimagenet_weights=args.radimagenet_weights)
         except PerceptualUnavailable as e:
             raise SystemExit(f'--perceptual: {e}')
         print(f'  [perceptual] device={scorer.device} lpips={args.lpips_net} '
-              f'fid_backend={scorer.fid_backend}')
+              f'fid_backend={scorer.fid_backend}'
+              + (f' radimagenet_backend={scorer.radimagenet_backend}'
+                 if scorer.radimagenet_backend else ''))
 
     print(f'Scoring {len(manifests)} models: {", ".join(manifests)}')
 
@@ -1046,6 +1113,9 @@ def main():
                           'fid_n_slices': scorer.n_slices(name),
                           'fid_backend': scorer.fid_backend,
                           'lpips_net': args.lpips_net})
+            if scorer.radimagenet_backend:
+                entry.update({'fid_rad': scorer.fid_rad(name),
+                              'radimagenet_backend': scorer.radimagenet_backend})
         fresh[name] = entry
         s = summarise(name, rows)
         print(f'  [{name}] n={s["n"]} PSNR {s["psnr"]:.2f} oSSIM {s["org_ssim"]:.4f} '
@@ -1077,7 +1147,7 @@ def main():
     for name in sorted(entries):
         e = entries[name]
         s = summarise(name, e['rows'])
-        for k in ('fid', 'fid_n_slices'):
+        for k in ('fid', 'fid_n_slices', 'fid_rad'):
             if k in e:
                 s[k] = e[k]
         summaries.append(s)
@@ -1087,18 +1157,27 @@ def main():
     # the runs that scored each model, not from the run that prints the table.
     have_perceptual = any(_finite(s.get('fid')) or _finite(s.get('lpips'))
                           for s in summaries)
+    have_radimagenet = any(_finite(s.get('fid_rad')) for s in summaries)
     backends = {e['fid_backend'] for e in entries.values() if e.get('fid_backend')}
+    rad_backends = {e['radimagenet_backend'] for e in entries.values()
+                    if e.get('radimagenet_backend')}
     nets = {e['lpips_net'] for e in entries.values() if e.get('lpips_net')}
     if len(backends) > 1:
         print(f'  [store] WARNING: FID computed with different Inception backends '
               f'({backends}); those values are not comparable to each other')
+    if len(rad_backends) > 1:
+        print(f'  [store] WARNING: fid_rad computed with different RadImageNet '
+              f'backends ({rad_backends}); those values are not comparable to '
+              f'each other')
     if len(nets) > 1:
         print(f'  [store] WARNING: LPIPS computed with different backbones ({nets})')
 
     lines: List[str] = []
     master_table(summaries, lines, perceptual=have_perceptual,
                  fid_backend=' / '.join(sorted(backends)) if backends else None,
-                 lpips_net=' / '.join(sorted(nets)) if nets else args.lpips_net)
+                 lpips_net=' / '.join(sorted(nets)) if nets else args.lpips_net,
+                 radimagenet=have_radimagenet,
+                 radimagenet_backend=' / '.join(sorted(rad_backends)) if rad_backends else None)
     # A missing paired block is a note in the report, never a hard exit: the
     # per-model scoring is the expensive part and stays worth writing out.
     base = resolve_baseline(all_rows, args.baseline)

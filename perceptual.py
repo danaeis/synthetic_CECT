@@ -57,6 +57,41 @@ is the weight set the FID literature is calibrated on. `torchvision`'s
 ImageNet-1k InceptionV3 is a fallback so the column can still be produced, but it
 yields a DIFFERENT number: `fid_backend` in the output records which was used and
 values from the two must never be pooled into one table.
+
+RADIMAGENET FID (`--radimagenet_weights`), OPT-IN ON TOP OF --perceptual
+--------------------------------------------------------------------------
+A second, independent FID column computed from a ResNet50 pretrained on
+RadImageNet (1.35M CT/MRI/ultrasound images: Mustafa et al., "RadImageNet",
+Radiology: AI 2022) instead of ImageNet photographs — the domain-matched
+backbone every "FID has no meaning on grayscale CT" caveat above is arguing for.
+It is reported as `fid_rad`, next to (never merged with) the ImageNet `fid`
+column, because they are not the same quantity and a reader comparing this table
+to another paper needs to know which backbone produced which number.
+
+Caveat worth weighing before leaning on it: McKinley et al./Woodland et al.,
+"Feature Extraction for Generative Medical Imaging Evaluation: New Evidence
+Against an Evolving Trend" (2024), found RadImageNet-based FID rankings on
+medical images were MORE volatile and LESS aligned with human judgment than
+ImageNet-based ones in their tests — the domain-matched backbone is not a proven
+upgrade, just a different, also-imperfect proxy that the NCCT→CECT literature
+increasingly reports. `fid_rad` is included for that comparability, not because
+it is known to be the more valid number.
+
+No `RadImageNet-LPIPS` is computed. LPIPS is not "any backbone's features plus a
+distance" — it is a backbone's features plus a LINEAR CALIBRATION LAYER trained
+to match human 2AFC perceptual judgments (`richzhang/PerceptualSimilarity`), and
+no such calibration has been published for a RadImageNet backbone. A cosine or L2
+distance in RadImageNet feature space is a different, uncalibrated metric and
+would be mislabeled if reported as "LPIPS".
+
+The RadImageNet weights are not fetched by this code. Point `--radimagenet_weights`
+at a local PyTorch state_dict (`.pt`/`.pth`) for a ResNet50 with the classifier
+head still attached — official source: github.com/BMEII-AI/RadImageNet (weights
+via their linked Google Drive). Loading is best-effort (`strict=False`): a
+`state_dict` whose keys don't line up with `torchvision.models.resnet50` (e.g. a
+straight Keras→PyTorch port with different layer names) will load partially or
+not at all, and `_load_radimagenet_resnet50` raises with a key-mismatch count
+rather than silently scoring on a mostly-random network.
 """
 
 from pathlib import Path
@@ -150,6 +185,61 @@ def _load_inception(device):
     return feats, _FID_BACKEND
 
 
+def _load_radimagenet_resnet50(weights_path: Path, device):
+    """2048-d ResNet50 pool features from a RadImageNet-pretrained state_dict.
+
+    Returns (callable(float tensor in [0,1], N3HW) -> (N,2048) tensor, backend
+    label). ResNet50's avgpool is already 2048-d — same dimensionality as the
+    InceptionV3 pool features FID normally uses, so `frechet_distance` needs no
+    changes to run on this backbone; it is simply a different Gaussian.
+
+    torchvision's `resnet50` architecture is the load target because it is the
+    best-aligned public PyTorch skeleton for a ResNet50 state_dict (clean 1:1
+    conv/BN/fc blocks); it is NOT guaranteed to be what produced whatever file
+    `weights_path` points at (community ports and any Keras->PyTorch conversion
+    have made independent naming choices). `strict=False` plus an explicit
+    mismatch count is the honest way to surface that rather than silently
+    scoring on a partially-random network.
+    """
+    import torch
+    from torchvision.models import resnet50
+
+    net = resnet50(weights=None)
+    n_params = len(list(net.state_dict()))
+    net.fc = torch.nn.Identity()          # expose the 2048-d pool instead of logits
+
+    raw = torch.load(weights_path, map_location=device)
+    if isinstance(raw, dict) and 'state_dict' in raw:
+        raw = raw['state_dict']
+    # Common prefixes added by training wrappers (DataParallel, a Keras-conversion
+    # script's own module nesting) that a bare torchvision resnet50 does not have.
+    state = {k.removeprefix('module.').removeprefix('model.'): v for k, v in raw.items()}
+
+    missing, unexpected = net.load_state_dict(state, strict=False)
+    # fc.{weight,bias} are expected-missing: we just replaced fc with Identity.
+    missing = [m for m in missing if not m.startswith('fc.')]
+    if len(missing) > n_params // 2:
+        raise PerceptualUnavailable(
+            f'--radimagenet_weights {weights_path}: {len(missing)}/{n_params} '
+            f'torchvision resnet50 parameters had no match in this state_dict '
+            f'(first few missing: {missing[:5]}; first few unused keys in the '
+            f'file: {list(unexpected)[:5]}). This usually means the file is not '
+            f'a torchvision-layout ResNet50 (e.g. a raw Keras conversion with '
+            f'different layer names) — rename its keys to match '
+            f'`torchvision.models.resnet50().state_dict()` before pointing this '
+            f'flag at it.')
+    if missing or unexpected:
+        print(f'  [radimagenet] loaded with {len(missing)} unmatched param(s) and '
+              f'{len(unexpected)} unused key(s) in the file — partial match, '
+              f'not a clean load. Verify features look reasonable before trusting fid_rad.')
+    net = net.to(device).eval()
+
+    def feats(x):
+        return net(x)
+
+    return feats, 'RadImageNet ResNet50 (PyTorch state_dict, community port)'
+
+
 class PerceptualScorer:
     """Accumulating FID + per-case LPIPS over the benchmark's models.
 
@@ -161,7 +251,8 @@ class PerceptualScorer:
 
     def __init__(self, device: Optional[str] = None, lpips_net: str = 'alex',
                  min_body_frac: float = 0.02, max_slices_per_case: Optional[int] = None,
-                 batch_size: int = 16, slice_axis: int = -1):
+                 batch_size: int = 16, slice_axis: int = -1,
+                 radimagenet_weights: Optional[Path] = None):
         import torch
 
         self.torch = torch
@@ -205,12 +296,25 @@ class PerceptualScorer:
         for p in self._lpips.parameters():
             p.requires_grad_(False)
 
-        self._inception, self.fid_backend = _load_inception(self.device)
+        inception_feats, self.fid_backend = _load_inception(self.device)
+        # backbone name -> feature fn. 'imagenet' is always present; 'radimagenet'
+        # only when weights were given, so add_case/fid degrade to NaN without it
+        # rather than requiring every caller to branch on whether it was loaded.
+        self._backbones: Dict[str, callable] = {'imagenet': inception_feats}
+        self.radimagenet_backend: Optional[str] = None
+        if radimagenet_weights is not None:
+            rad_feats, self.radimagenet_backend = _load_radimagenet_resnet50(
+                Path(radimagenet_weights), self.device)
+            self._backbones['radimagenet'] = rad_feats
 
-        # model -> list of (n_slices, 2048) arrays; and the shared real cache.
-        self._gen_feats: Dict[str, List[np.ndarray]] = {}
-        self._real_feats: Dict[str, np.ndarray] = {}
-        self._real_order: Dict[str, List[str]] = {}
+        # backbone -> model -> list of (n_slices, 2048) arrays; and the shared
+        # per-backbone real-feature cache (real features don't depend on model).
+        self._gen_feats: Dict[str, Dict[str, List[np.ndarray]]] = {
+            b: {} for b in self._backbones}
+        self._real_feats: Dict[str, Dict[str, np.ndarray]] = {
+            b: {} for b in self._backbones}
+        self._real_order: Dict[str, Dict[str, List[str]]] = {
+            b: {} for b in self._backbones}
 
     # -- slice extraction ---------------------------------------------------
 
@@ -245,43 +349,54 @@ class PerceptualScorer:
                 vals.append(self._lpips(a, b).flatten().cpu().numpy())
         return float(np.concatenate(vals).mean()) if vals else float('nan')
 
-    def _features(self, vol01: np.ndarray, idx: np.ndarray) -> np.ndarray:
+    def _features(self, vol01: np.ndarray, idx: np.ndarray, backbone: str) -> np.ndarray:
         st = self._stack(vol01, idx)
+        feats_fn = self._backbones[backbone]
         out = []
         with self.torch.no_grad():
             for i in range(0, st.shape[0], self.batch_size):
-                out.append(self._inception(st[i:i + self.batch_size].to(self.device))
+                out.append(feats_fn(st[i:i + self.batch_size].to(self.device))
                            .cpu().numpy())
         return np.concatenate(out) if out else np.zeros((0, 2048), dtype=np.float32)
 
     def add_case(self, model: str, case_key: str, g01: np.ndarray, r01: np.ndarray,
                  bmask: np.ndarray) -> float:
-        """Accumulate this case into `model`'s FID set; return its LPIPS.
+        """Accumulate this case into `model`'s FID set(s) for every loaded backbone
+        ('imagenet', and 'radimagenet' if `--radimagenet_weights` was given);
+        return its (ImageNet-backbone) LPIPS — see the module docstring for why
+        there is no RadImageNet-LPIPS.
 
         The real features are computed once per `case_key` and reused for every
         later model — correct because the slice selection comes from the real
         volume's body mask and so does not depend on the model.
         """
         idx = self._select(bmask)
-        self._gen_feats.setdefault(model, []).append(self._features(g01, idx))
-        if case_key not in self._real_feats:
-            self._real_feats[case_key] = self._features(r01, idx)
-        self._real_order.setdefault(model, []).append(case_key)
+        for b in self._backbones:
+            self._gen_feats[b].setdefault(model, []).append(self._features(g01, idx, b))
+            if case_key not in self._real_feats[b]:
+                self._real_feats[b][case_key] = self._features(r01, idx, b)
+            self._real_order[b].setdefault(model, []).append(case_key)
         return self.case_lpips(g01, r01, bmask)
 
-    def fid(self, model: str) -> float:
-        """FID for one model, against exactly the real slices of ITS OWN cases.
+    def fid(self, model: str, backbone: str = 'imagenet') -> float:
+        """FID for one model on one backbone, against exactly the real slices of
+        ITS OWN cases.
 
         Restricting the real set to the cases this model actually scored matters
         for the multi-phase arms, which each cover a different subset — pooling
         every real volume in the run would compare an arterial model against a
         real set that is mostly venous.
+
+        NaN if `backbone` was never loaded (e.g. `fid('m', 'radimagenet')`
+        without `--radimagenet_weights`) rather than a KeyError, so callers can
+        request it unconditionally and get an absent column instead of a crash.
         """
-        gf = self._gen_feats.get(model)
+        gf = self._gen_feats.get(backbone, {}).get(model)
         if not gf:
             return float('nan')
         g = np.concatenate(gf)
-        r = np.concatenate([self._real_feats[k] for k in self._real_order[model]])
+        real_feats, real_order = self._real_feats[backbone], self._real_order[backbone]
+        r = np.concatenate([real_feats[k] for k in real_order[model]])
         # 2048-d covariance from < ~2049 samples is rank-deficient; the estimate is
         # then dominated by that deficiency rather than by image quality.
         if g.shape[0] < 2 or r.shape[0] < 2:
@@ -289,6 +404,10 @@ class PerceptualScorer:
         return frechet_distance(g.mean(0), np.cov(g, rowvar=False),
                                 r.mean(0), np.cov(r, rowvar=False))
 
+    def fid_rad(self, model: str) -> float:
+        """FID on the RadImageNet backbone — NaN when it was not loaded."""
+        return self.fid(model, backbone='radimagenet')
+
     def n_slices(self, model: str) -> int:
-        gf = self._gen_feats.get(model)
+        gf = self._gen_feats.get('imagenet', {}).get(model)
         return int(sum(f.shape[0] for f in gf)) if gf else 0
