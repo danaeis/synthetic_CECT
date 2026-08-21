@@ -85,13 +85,16 @@ distance in RadImageNet feature space is a different, uncalibrated metric and
 would be mislabeled if reported as "LPIPS".
 
 The RadImageNet weights are not fetched by this code. Point `--radimagenet_weights`
-at a local PyTorch state_dict (`.pt`/`.pth`) for a ResNet50 with the classifier
-head still attached — official source: github.com/BMEII-AI/RadImageNet (weights
-via their linked Google Drive). Loading is best-effort (`strict=False`): a
-`state_dict` whose keys don't line up with `torchvision.models.resnet50` (e.g. a
-straight Keras→PyTorch port with different layer names) will load partially or
-not at all, and `_load_radimagenet_resnet50` raises with a key-mismatch count
-rather than silently scoring on a mostly-random network.
+at a local PyTorch state_dict (`.pt`/`.pth`) — official source:
+github.com/BMEII-AI/RadImageNet (weights via their linked Google Drive). The
+official PyTorch ResNet50.pt wraps the network (fc already stripped) in a plain
+`nn.Sequential`, so its keys are `backbone.<child-index>...` rather than
+`conv1...`/`layer1...`; `_remap_backbone_keys` translates that specific,
+verified-by-inspection layout automatically. Loading is otherwise best-effort
+(`strict=False`): a `state_dict` in some other layout (e.g. a from-scratch
+Keras→PyTorch conversion) will load partially or not at all, and
+`_load_radimagenet_resnet50` raises with a key-mismatch count rather than
+silently scoring on a mostly-random network.
 """
 
 from pathlib import Path
@@ -185,6 +188,29 @@ def _load_inception(device):
     return feats, _FID_BACKEND
 
 
+# backbone.<i> -> the torchvision resnet50 attribute name at children()[i]. The
+# official BMEII-AI/RadImageNet PyTorch release wraps resnet50 minus its `fc` in
+# a plain nn.Sequential (`backbone = nn.Sequential(*list(resnet50().children())
+# [:-1])`), so its state_dict keys are `backbone.0.weight`, `backbone.4.0.conv1.
+# weight`, etc. instead of `conv1.weight`/`layer1.0.conv1.weight`. Indices 2, 3, 8
+# (relu/maxpool/avgpool) carry no parameters and so never appear as key prefixes.
+# Confirmed by disassembling the actual .pt file's pickle stream, not assumed.
+_RESNET50_CHILD_INDEX = {'0': 'conv1', '1': 'bn1', '4': 'layer1',
+                         '5': 'layer2', '6': 'layer3', '7': 'layer4'}
+
+
+def _remap_backbone_keys(raw: dict) -> dict:
+    out = {}
+    for k, v in raw.items():
+        if not k.startswith('backbone.'):
+            out[k] = v
+            continue
+        idx, _, tail = k[len('backbone.'):].partition('.')
+        name = _RESNET50_CHILD_INDEX.get(idx)
+        out[f'{name}.{tail}' if name else k] = v
+    return out
+
+
 def _load_radimagenet_resnet50(weights_path: Path, device):
     """2048-d ResNet50 pool features from a RadImageNet-pretrained state_dict.
 
@@ -214,6 +240,7 @@ def _load_radimagenet_resnet50(weights_path: Path, device):
     # Common prefixes added by training wrappers (DataParallel, a Keras-conversion
     # script's own module nesting) that a bare torchvision resnet50 does not have.
     state = {k.removeprefix('module.').removeprefix('model.'): v for k, v in raw.items()}
+    state = _remap_backbone_keys(state)
 
     missing, unexpected = net.load_state_dict(state, strict=False)
     # fc.{weight,bias} are expected-missing: we just replaced fc with Identity.
