@@ -546,7 +546,7 @@ FAMILY_ORDER = ['UNet + PatchGAN (this repo)', 'Diffusion',
 # pipeline. Extend this set — do not rename it away — the next time a new
 # external repo is scored, or it silently lands in "this repo"'s section.
 _EXTERNAL_KEYWORDS = ('pix2pixhd', 'resvit', 'resnet', 'cyclegan', 'gan_ext',
-                      'cytran', 'syndiff')
+                      'cytran', 'syndiff', 'gea_gan', 'dea_gan', 'eagan')
 
 
 def model_family(name: str) -> str:
