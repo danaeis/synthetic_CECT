@@ -59,6 +59,7 @@ yields a DIFFERENT number: `fid_backend` in the output records which was used an
 values from the two must never be pooled into one table.
 """
 
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -180,7 +181,27 @@ class PerceptualScorer:
                 f'weights, which cannot be reconstructed from torchvision): {e}. '
                 'pip install lpips') from e
         self.lpips_net_name = lpips_net
-        self._lpips = _lpips.LPIPS(net=lpips_net).to(self.device).eval()
+        # The import succeeding is not enough: LPIPS loads its learned LINEAR
+        # weights from package data (`lpips/weights/v0.1/<net>.pth`), and an
+        # install can be importable with that directory missing — pip caches,
+        # partial copies, --no-binary builds. The failure then surfaces as a bare
+        # FileNotFoundError from torch.load, AFTER torchvision has spent minutes
+        # downloading the backbone, and looks like a benchmark bug rather than an
+        # install one.
+        try:
+            self._lpips = _lpips.LPIPS(net=lpips_net).to(self.device).eval()
+        except (FileNotFoundError, OSError) as e:
+            wdir = Path(_lpips.__file__).parent / 'weights' / 'v0.1'
+            raise PerceptualUnavailable(
+                f'the `lpips` package is installed but its learned linear weights '
+                f'are missing ({e}). These ship inside the package and are not the '
+                f'torchvision backbone, so re-downloading the backbone will not fix '
+                f'it. Repair with:\n'
+                f'    pip install --force-reinstall --no-cache-dir lpips\n'
+                f'  or fetch the one file (~6 KB):\n'
+                f'    curl -L -o {wdir / (lpips_net + ".pth")} \\\n'
+                f'      https://github.com/richzhang/PerceptualSimilarity/raw/'
+                f'master/lpips/weights/v0.1/{lpips_net}.pth') from e
         for p in self._lpips.parameters():
             p.requires_grad_(False)
 

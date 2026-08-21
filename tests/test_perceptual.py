@@ -154,6 +154,51 @@ def test_select_honours_slice_axis():
     assert idx.tolist() == list(range(4, 12))
 
 
+def test_missing_lpips_weights_is_actionable():
+    """An importable `lpips` with no weights on disk must not escape as a raw
+    FileNotFoundError.
+
+    LPIPS loads its learned LINEAR weights from package data
+    (`lpips/weights/v0.1/<net>.pth`), separately from the torchvision backbone it
+    downloads at construction. An install can be importable with that directory
+    missing, and the resulting `torch.load` failure surfaced AFTER a multi-minute
+    backbone download, as a traceback that reads like a benchmark bug. It has to
+    route through PerceptualUnavailable so `--perceptual` exits with the repair
+    command instead — before any volume is scored.
+    """
+    import types
+    import perceptual as P
+    from perceptual import PerceptualUnavailable
+
+    fake = types.ModuleType('lpips')
+    fake.__file__ = '/nonexistent/site-packages/lpips/__init__.py'
+
+    def _boom(net='alex'):
+        raise FileNotFoundError(
+            2, 'No such file or directory',
+            f'/nonexistent/site-packages/lpips/weights/v0.1/{net}.pth')
+
+    fake.LPIPS = _boom
+    saved = sys.modules.get('lpips')
+    sys.modules['lpips'] = fake
+    try:
+        P.PerceptualScorer(device='cpu')
+        raise AssertionError('expected PerceptualUnavailable, no exception raised')
+    except PerceptualUnavailable as e:
+        msg = str(e)
+        assert 'pip install --force-reinstall' in msg, f'no repair command: {msg}'
+        # The distinction that actually saves time: re-running does not help,
+        # because the backbone download is not what failed.
+        assert 'not the torchvision backbone' in msg, f'no disambiguation: {msg}'
+    except ImportError:
+        raise AssertionError('torch missing — cannot exercise this path here')
+    finally:
+        if saved is not None:
+            sys.modules['lpips'] = saved
+        else:
+            sys.modules.pop('lpips', None)
+
+
 if __name__ == '__main__':
     fns = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     failed = 0

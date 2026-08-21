@@ -25,16 +25,32 @@ cases scored by two models), plus per-model per-case std, because between-case
 variance dominates between-model differences on this data. There is no
 epoch-to-epoch "noise floor" here — that only existed inside a training run.
 
+RESULTS ACCUMULATE. Each model's per-case rows are cached under `<out>/store/`
+and reloaded on every later run, so a model is scored once — when it finishes
+training — and still appears in every table printed afterwards. Scoring a model
+again overwrites its entry. Everything that depends on the full set (best/second
+marks, the paired t-tests, the level-recovery regressions) is recomputed from the
+merged rows each time, so adding the 6th model updates the table for the first 5.
+Entries scored under different settings (HU window, HU-vs-model scale, phase
+classifier) are refused rather than pooled.
+
 Usage:
     # auto-discover the existing runs (each has phase_infer/manifest.csv):
     python benchmark.py --runs_dir ../out_synthesis_train \
         --weights orgFeatXGB_CTPhase/xgb_vindr_full.pkl --out analysis/benchmark
 
-    # or explicit models:
-    python benchmark.py --weights xgb.pkl \
-        --manifest ours=.../manifest.csv --manifest resvit=.../manifest.csv
+    # one model at a time — each run prints the table for EVERY model scored so far
+    python benchmark.py --weights xgb.pkl --out analysis/benchmark --perceptual \
+        --manifest resvit=../ncct2cect/ResViT/results/vindr_nifti/manifest.csv
+    python benchmark.py --weights xgb.pkl --out analysis/benchmark --perceptual \
+        --manifest syndiff=../ncct2cect/SynDiff/results/vindr_nifti/manifest.csv
 
-    # add the literature-comparability columns (needs lpips + pytorch-fid):
+    # what is cached / retire a superseded run / ignore the cache for one report
+    python benchmark.py --weights xgb.pkl --out analysis/benchmark --list_store
+    python benchmark.py --weights xgb.pkl --out analysis/benchmark --drop resvit
+    python benchmark.py ... --fresh          # table from this run's models only
+
+    # the literature-comparability columns (needs lpips + pytorch-fid):
     python benchmark.py --runs_dir ../out_synthesis_train --weights xgb.pkl \
         --out analysis/benchmark_all --perceptual
 """
@@ -277,8 +293,24 @@ def _nanmean(xs):
 
 
 def _nanstd(xs):
+    # ddof=1 (SAMPLE sd): these 20 cases are a sample of the case population, and
+    # `x ± sd` in the tables this benchmark is read against is the sample sd. With
+    # n=20 the population form understates the spread by ~2.6%.
     xs = [x for x in xs if x is not None and not (isinstance(x, float) and math.isnan(x))]
-    return float(np.std(xs)) if len(xs) > 1 else 0.0
+    return float(np.std(xs, ddof=1)) if len(xs) > 1 else float('nan')
+
+
+# Metrics that are a RATE over cases (a 0/1 outcome each). Their sample sd is
+# sqrt(p(1-p)) — fixed by the mean alone, so printing it adds nothing and fills a
+# column with '1.00 ± 0.00'. The binomial standard error is the real uncertainty
+# on the rate and does depend on n, so that is what gets reported for these.
+RATE_METRICS = {'phase_acc', 'agree_real'}
+
+# Summary key -> the per-case row key it is averaged from. `aggregate()` returns
+# means only, so without this featHU — the primary metric of the whole benchmark —
+# was the one column shipping with no dispersion at all.
+PHASE_PER_CASE = {'phase_acc': 'phase_match', 'agree_real': 'agree_real',
+                  'gen_prob': 'gen_prob', 'feature_l1_hu': 'feature_l1_hu'}
 
 
 def summarise(name: str, rows: List[Dict]) -> Dict:
@@ -298,6 +330,16 @@ def summarise(name: str, rows: List[Dict]) -> Dict:
         'gen_prob': ph.get('mean_gen_target_prob'),
         'feature_l1_hu': ph.get('mean_feature_l1_hu'),
     })
+    # Dispersion for those four, from the same per-case rows `aggregate` averaged.
+    # Rates get a binomial standard error instead of a sd — see RATE_METRICS.
+    for key, per_case in PHASE_PER_CASE.items():
+        vals = [r.get(per_case) for r in rows]
+        if key in RATE_METRICS:
+            p, k = out.get(key), len([v for v in vals if v is not None])
+            out[key + '_std'] = (math.sqrt(p * (1 - p) / k)
+                                 if _finite(p) and k else float('nan'))
+        else:
+            out[key + '_std'] = _nanstd(vals)
 
     # Across-case level recovery: regress gen median HU on real median HU per
     # organ (needs every case's medians at once, so it lives here, not per-case),
@@ -321,6 +363,12 @@ def summarise(name: str, rows: List[Dict]) -> Dict:
             vrs.append(rec['var_ratio'])
     out['lev_beta'] = float(np.mean(betas)) if betas else float('nan')
     out['lev_varr'] = float(np.mean(vrs)) if vrs else float('nan')
+    # NOTE these two spreads are ACROSS ORGANS, not across cases like every other
+    # `_std` column — each organ already consumed all 20 cases to fit its slope.
+    # A wide spread here means the model tracks enhancement in some organs and not
+    # others, which is a different claim from case-to-case variability.
+    out['lev_beta_std'] = _nanstd(betas)
+    out['lev_varr_std'] = _nanstd(vrs)
     out['_lev_per_organ'] = per_organ
     return out
 
@@ -522,15 +570,23 @@ def _rank_marks(summaries: List[Dict], key: str, direction: Optional[str]) -> Di
     return marks
 
 
-def _cell(value, fmt: str, mark: Optional[str]) -> str:
-    """Format one cell, wrapping the best in **bold** and the second in _italics_."""
+def _cell(value, fmt: str, mark: Optional[str], spread=None) -> str:
+    """Format one cell as `mean ± spread`, best in **bold**, second in _italics_.
+
+    The emphasis wraps the mean only: bolding the spread too would read as "this
+    model has the best variance", which is a different claim and usually false.
+    A column with no per-case spread (FID is distributional, `n` is a count)
+    passes spread=None and renders bare.
+    """
     if not _finite(value):
         return '—'
     txt = fmt.format(value)
     if mark == 'best':
-        return f'**{txt}**'
-    if mark == 'second':
-        return f'_{txt}_'
+        txt = f'**{txt}**'
+    elif mark == 'second':
+        txt = f'_{txt}_'
+    if _finite(spread):
+        txt += f' ± {fmt.format(spread)}'
     return txt
 
 
@@ -550,7 +606,8 @@ def _category_table(title: str, specs, summaries: List[Dict], out: List[str]):
         # cleanly and keeps the columns aligned).
         out.append(f'| **{family}** | ' + ' | '.join('' for _ in specs) + ' |')
         for s in fam:
-            cells = [_cell(s.get(key), fmt, marks[key].get(s['model']))
+            cells = [_cell(s.get(key), fmt, marks[key].get(s['model']),
+                           s.get(key + '_std'))
                      for key, _, fmt, _ in specs]
             out.append(f'| {s["model"]} | ' + ' | '.join(cells) + ' |')
 
@@ -576,6 +633,18 @@ def master_table(summaries: List[Dict], out: List[str], perceptual: bool = False
                 continue
         _category_table(title, specs, summaries, out)
 
+    out.append('\n**Spread.** Every cell is `mean ± sd` **across the n test cases**, sample '
+               'sd (ddof=1), so it is directly comparable to the `x ± s` convention in the '
+               'published tables. Bold/italic mark the best and second-best MEAN only. Two '
+               'exceptions: **phase** and **agree_real** are rates over 0/1 outcomes, whose sd '
+               'is fixed by the mean alone, so those carry the binomial standard error '
+               '`sqrt(p(1-p)/n)` instead; and **βlev/varR** spread is across ORGANS, not '
+               'cases, since each organ already used all n cases to fit its slope. FID has no '
+               'per-case value at all (it is distributional) and so has no ±.')
+    out.append('\nBetween-case variance dominates between-model differences on this data — '
+               'a large ± next to a small difference in means is the normal situation here, '
+               'and it is the reason model comparisons go through the PAIRED per-case tests '
+               'below rather than through these spreads.')
     out.append('\n**How to read these tables.** The *Image-level (global pixel)* '
                'category is SECONDARY and flat by construction: `to_unit` saturates '
                'air/lung/fat→0 and bone→1 identically in every model, so those columns '
@@ -672,6 +741,144 @@ def discover(runs_dir: Path) -> Dict[str, Path]:
     return found
 
 
+# ---------------------------------------------------------------------------
+# Result store — accumulate models across separate benchmark.py invocations
+# ---------------------------------------------------------------------------
+# Models are trained and inferred one at a time, often days apart and on
+# different machines, but the table is only meaningful as a JOINT comparison:
+# best/second-best marks, the family grouping and the paired t-tests all need
+# every model present at once. Re-scoring every previously finished model on each
+# new run costs ~an hour of volume I/O per model, so instead each scored model's
+# PER-CASE rows are persisted here and reloaded on the next run.
+#
+# Per-case rows, not summary numbers: the paired block needs each case's value,
+# and level recovery regresses across cases, so a stored mean would be a dead end.
+#
+# What is NOT stored is as important — nothing derived from the OTHER models. Every
+# aggregate that depends on the full set (ranking, paired deltas) is recomputed
+# from the merged rows on every run, so adding the 6th model retroactively updates
+# the table for the first 5.
+
+STORE_VERSION = 1
+
+
+def _fingerprint(args, weights: Path) -> Dict:
+    """The scoring settings a stored row must share to be comparable.
+
+    Pooling a model scored on HU[-200,400] with one scored on a different window,
+    or against a different phase classifier, produces a table whose columns are
+    not the same quantity — and nothing in the numbers themselves reveals it. So
+    the settings travel with the rows and mismatches are refused, not averaged.
+
+    `--perceptual` settings are deliberately excluded: a model scored without it
+    has NaN LPIPS/FID and still pools correctly with one that has them. The
+    perceptual settings are recorded per entry and checked separately, only among
+    the entries that actually carry perceptual numbers.
+    """
+    try:
+        wsig = f'{weights.name}:{weights.stat().st_size}'
+    except OSError:
+        wsig = weights.name
+    return {
+        'store_version': STORE_VERSION,
+        'hu_min': float(args.hu_min),
+        'hu_max': float(args.hu_max),
+        'gen_in_hu': not args.gen_not_hu,
+        'weights': wsig,
+    }
+
+
+def _slug(name: str) -> str:
+    """Filesystem-safe, collision-free filename stem for a model name.
+
+    Model names legitimately contain '/' (the multi-phase arms are '<run>/<phase>'),
+    and two different names could sanitise to the same string, which would make one
+    model silently overwrite another's stored results. The hash suffix makes that
+    impossible; the readable prefix keeps the directory browsable.
+    """
+    import hashlib
+    safe = ''.join(c if (c.isalnum() or c in '-_.') else '_' for c in name)
+    return f'{safe[:60]}_{hashlib.sha1(name.encode()).hexdigest()[:8]}'
+
+
+def _json_default(o):
+    """numpy scalars/arrays -> plain Python, so a row round-trips through JSON.
+
+    `phase_eval.score_case` returns numpy ints for pred_gen/pred_real; without
+    this the whole store write fails on the first model.
+    """
+    if isinstance(o, (np.integer,)):
+        return int(o)
+    if isinstance(o, (np.floating,)):
+        return float(o)
+    if isinstance(o, (np.bool_,)):
+        return bool(o)
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    raise TypeError(f'not JSON serialisable: {type(o)}')
+
+
+def store_write(store: Path, name: str, rows: List[Dict], fp: Dict,
+                extra: Dict) -> Path:
+    """Persist one model's per-case rows. Re-scoring a model overwrites its entry."""
+    store.mkdir(parents=True, exist_ok=True)
+    import datetime as _dt
+    path = store / f'{_slug(name)}.json'
+    payload = {
+        'model': name,
+        'scored_at': _dt.datetime.now().astimezone().isoformat(timespec='seconds'),
+        'fingerprint': fp,
+        'rows': rows,
+        **extra,          # fid, fid_n_slices, fid_backend, lpips_net, manifest
+    }
+    # allow_nan: NaN is a real value in these rows (an organ absent from a case).
+    # It makes the file non-strict JSON, which is fine — Python's json reads it
+    # back as float('nan') and nothing else consumes these files.
+    path.write_text(json.dumps(payload, default=_json_default, allow_nan=True))
+    return path
+
+
+def store_read(store: Path, fp: Dict, skip: set) -> Dict[str, Dict]:
+    """Load every compatible stored model except those in `skip`.
+
+    `skip` holds the models scored fresh in THIS run: their new rows supersede
+    whatever the store had, and loading both would double-count the model.
+
+    An entry whose fingerprint disagrees is reported and dropped rather than
+    silently pooled — see _fingerprint. A corrupt file is likewise reported and
+    skipped, because losing one cached model is recoverable (re-score it) and
+    aborting the whole report is not.
+    """
+    out: Dict[str, Dict] = {}
+    if not store.is_dir():
+        return out
+    stale = []
+    for p in sorted(store.glob('*.json')):
+        try:
+            e = json.loads(p.read_text())
+        except Exception as ex:            # noqa: BLE001
+            print(f'  [store] unreadable, skipped: {p.name} ({ex})')
+            continue
+        name = e.get('model')
+        if not name or name in skip:
+            continue
+        if e.get('fingerprint') != fp:
+            stale.append((name, e.get('fingerprint', {})))
+            continue
+        out[name] = e
+    if stale:
+        print(f'  [store] {len(stale)} entr(y/ies) scored under different settings '
+              f'and EXCLUDED from this table: ' +
+              ', '.join(n for n, _ in stale))
+        for n, f in stale:
+            diff = {k: (f.get(k), fp.get(k)) for k in set(f) | set(fp)
+                    if f.get(k) != fp.get(k)}
+            print(f'            {n}: {diff}  (stored, current)')
+        print('            re-score them with the current settings, or point '
+              '--store at a different directory')
+    return out
+
+
 def resolve_baseline(names, requested: str | None):
     """Map a `--baseline` spelling onto a model name, or None if it matches none.
 
@@ -727,7 +934,46 @@ def main():
     ap.add_argument('--max_slices_per_case', type=int, default=None,
                     help='evenly subsample at most this many slices per case '
                          '(speed/memory); default uses every qualifying slice')
+    # -- accumulating store --------------------------------------------------
+    ap.add_argument('--store', type=Path, default=None,
+                    help='directory of per-model cached results (default '
+                         '<out>/store). Models scored in earlier runs are reloaded '
+                         'from here and appear in the same table, so each model can '
+                         'be benchmarked once, when it finishes training')
+    ap.add_argument('--no_store', action='store_true',
+                    help='neither read nor write the store: score exactly the '
+                         'models given on this command line')
+    ap.add_argument('--fresh', action='store_true',
+                    help='write to the store but build the table only from the '
+                         'models scored in this run')
+    ap.add_argument('--drop', action='append', default=[], metavar='MODEL',
+                    help='delete MODEL from the store and exit (repeatable) — for '
+                         'retiring a superseded run')
+    ap.add_argument('--list_store', action='store_true',
+                    help='list the cached models and exit')
     args = ap.parse_args()
+
+    store = args.store if args.store is not None else args.out / 'store'
+    weights_path = Path(args.weights)
+    fp = _fingerprint(args, weights_path)
+
+    if args.list_store:
+        entries = store_read(store, fp, skip=set())
+        if not entries:
+            raise SystemExit(f'store {store} holds no compatible entries')
+        print(f'{store}:')
+        for name, e in sorted(entries.items()):
+            n = len(e.get('rows', []))
+            fid = e.get('fid')
+            print(f'  {name:40s} n={n:<4d} scored_at={e.get("scored_at", "?")}'
+                  + (f' fid={fid:.1f}' if _finite(fid) else ''))
+        return
+    if args.drop:
+        for name in args.drop:
+            p = store / f'{_slug(name)}.json'
+            print(f'  [store] {"removed" if p.exists() else "not present"}: {name}')
+            p.unlink(missing_ok=True)
+        return
 
     manifests: Dict[str, Path] = {}
     if args.runs_dir:
@@ -778,7 +1024,7 @@ def main():
 
     print(f'Scoring {len(manifests)} models: {", ".join(manifests)}')
 
-    all_rows, summaries = {}, []
+    fresh: Dict[str, Dict] = {}
     for name, mpath in manifests.items():
         if not mpath.exists():
             print(f'  [{name}] manifest missing: {mpath} — skipped')
@@ -789,24 +1035,70 @@ def main():
         if not rows:
             print(f'  [{name}] no scored cases — skipped')
             continue
-        all_rows[name] = rows
-        summaries.append(summarise(name, rows))
+        entry = {'model': name, 'rows': rows, 'manifest': str(mpath)}
         if scorer is not None:
             # FID is distributional, so it exists only once every case of this
             # model has been accumulated — it cannot come out of summarise().
-            summaries[-1]['fid'] = scorer.fid(name)
-            summaries[-1]['fid_n_slices'] = scorer.n_slices(name)
-        s = summaries[-1]
+            # It is well-defined per model on its own (PerceptualScorer.fid scores
+            # each model against the real slices of ITS OWN cases), which is what
+            # makes caching it across runs valid at all.
+            entry.update({'fid': scorer.fid(name),
+                          'fid_n_slices': scorer.n_slices(name),
+                          'fid_backend': scorer.fid_backend,
+                          'lpips_net': args.lpips_net})
+        fresh[name] = entry
+        s = summarise(name, rows)
         print(f'  [{name}] n={s["n"]} PSNR {s["psnr"]:.2f} oSSIM {s["org_ssim"]:.4f} '
               f'featHU {s["feature_l1_hu"]:.2f}')
+        if not args.no_store:
+            p = store_write(store, name, rows, fp,
+                            {k: v for k, v in entry.items()
+                             if k not in ('model', 'rows')})
+            print(f'  [{name}] cached -> {p}')
 
-    if not all_rows:
+    # Merge in every previously scored model so the table is a joint comparison
+    # even though the models were benchmarked one at a time. Fresh rows win over
+    # a stored entry for the same model.
+    entries: Dict[str, Dict] = {}
+    if not (args.no_store or args.fresh):
+        prev = store_read(store, fp, skip=set(fresh))
+        if prev:
+            print(f'  [store] + {len(prev)} model(s) from earlier runs: '
+                  + ', '.join(sorted(prev)))
+        entries.update(prev)
+    entries.update(fresh)
+    if not entries:
         raise SystemExit('no model produced scored cases — nothing to report')
 
+    # Sorted by name so the table's row order is stable no matter which model was
+    # scored in which run; the display grouping by family reorders anyway.
+    all_rows = {n: entries[n]['rows'] for n in sorted(entries)}
+    summaries = []
+    for name in sorted(entries):
+        e = entries[name]
+        s = summarise(name, e['rows'])
+        for k in ('fid', 'fid_n_slices'):
+            if k in e:
+                s[k] = e[k]
+        summaries.append(s)
+
+    # Render the perceptual block whenever the DATA has it, not whenever this
+    # invocation passed --perceptual: with the store, LPIPS/FID usually come from
+    # the runs that scored each model, not from the run that prints the table.
+    have_perceptual = any(_finite(s.get('fid')) or _finite(s.get('lpips'))
+                          for s in summaries)
+    backends = {e['fid_backend'] for e in entries.values() if e.get('fid_backend')}
+    nets = {e['lpips_net'] for e in entries.values() if e.get('lpips_net')}
+    if len(backends) > 1:
+        print(f'  [store] WARNING: FID computed with different Inception backends '
+              f'({backends}); those values are not comparable to each other')
+    if len(nets) > 1:
+        print(f'  [store] WARNING: LPIPS computed with different backbones ({nets})')
+
     lines: List[str] = []
-    master_table(summaries, lines, perceptual=scorer is not None,
-                 fid_backend=(scorer.fid_backend if scorer else None),
-                 lpips_net=args.lpips_net)
+    master_table(summaries, lines, perceptual=have_perceptual,
+                 fid_backend=' / '.join(sorted(backends)) if backends else None,
+                 lpips_net=' / '.join(sorted(nets)) if nets else args.lpips_net)
     # A missing paired block is a note in the report, never a hard exit: the
     # per-model scoring is the expensive part and stays worth writing out.
     base = resolve_baseline(all_rows, args.baseline)
@@ -817,9 +1109,20 @@ def main():
         lines.append(f'\n_Baseline {args.baseline!r} scored no cases — paired tests '
                      'skipped._')
     else:
+        # LPIPS enters the paired block whenever the merged rows carry it — the
+        # models may have been scored with --perceptual in earlier runs even if
+        # this invocation was not given the flag.
+        have_lpips = any(_finite(r.get('lpips'))
+                         for rows in all_rows.values() for r in rows)
         paired_block(all_rows, base, lines,
-                     metrics=(PAIRED_METRICS + LPIPS_PAIRED if scorer is not None
+                     metrics=(PAIRED_METRICS + LPIPS_PAIRED if have_lpips
                               else PAIRED_METRICS))
+    if not (args.no_store or args.fresh):
+        lines.append(f'\n_Table built from {len(summaries)} model(s) accumulated in '
+                     f'`{store}` ({len(fresh)} scored in this run). Each model is '
+                     'scored once and cached; every cross-model quantity — ranking, '
+                     'paired deltas, level-recovery regressions — is recomputed from '
+                     'the merged per-case rows on every run._')
     report = '\n'.join(lines)
     print('\n' + report)
 
@@ -827,17 +1130,30 @@ def main():
     (args.out / 'master_table.md').write_text(report)
     # Drop internal book-keeping keys (_lev_per_organ, etc.) from the CSVs — they
     # carry nested dicts that stringify into unusable cells.
+    #
+    # Column set is the UNION over models, not the first model's keys: a stored
+    # entry can predate a metric that was added later (or lack fid because it was
+    # scored without --perceptual), and DictWriter raises on any unexpected key.
+    # restval='' leaves the cell empty for a model that genuinely lacks the column.
+    def _union_keys(dicts, first):
+        seen = list(first)
+        for d in dicts:
+            for k in d:
+                if k not in seen and not k.startswith('_'):
+                    seen.append(k)
+        return seen
+
     with (args.out / 'master_table.csv').open('w', newline='') as f:
-        keys = [k for k in summaries[0] if not k.startswith('_') and k != 'model']
-        rows_out = [{k: s.get(k) for k in ['model'] + keys} for s in summaries]
-        w = csv.DictWriter(f, fieldnames=['model'] + keys)
+        keys = _union_keys(summaries, ['model'])
+        w = csv.DictWriter(f, fieldnames=keys, restval='', extrasaction='ignore')
         w.writeheader()
-        w.writerows(rows_out)
+        w.writerows([{k: s.get(k) for k in keys} for s in summaries])
     # per-case rows for downstream analysis (drop _key / _lvl / _phase_case)
     with (args.out / 'per_case.csv').open('w', newline='') as f:
         flat = [{k: v for k, v in r.items() if not k.startswith('_')}
                 for rows in all_rows.values() for r in rows]
-        w = csv.DictWriter(f, fieldnames=list(flat[0]))
+        w = csv.DictWriter(f, fieldnames=_union_keys(flat, ['model', 'case']),
+                           restval='', extrasaction='ignore')
         w.writeheader()
         w.writerows(flat)
     print(f'\n[written] {args.out}/master_table.md, master_table.csv, per_case.csv')

@@ -29,6 +29,7 @@ import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import json
+import math
 import shutil
 import tempfile
 
@@ -320,6 +321,58 @@ def test_master_table_categorised():
           '| LPIPS | FID |' in t2 and '**0.1900**' in t2)
 
 
+def _phase_rows(feat, prob, match, agree):
+    """Per-case rows shaped the way score_model emits them."""
+    return [{'_key': f'/c{i}', 'psnr': 30.0 + i,
+             'feature_l1_hu': f, 'gen_prob': p, 'phase_match': m, 'agree_real': a,
+             '_lvl': {},
+             '_phase_case': {'gen_matches_target': bool(m), 'gen_matches_real': bool(a),
+                             'gen_target_prob': p, 'feature_l1_hu': f,
+                             'target_phase': 2, 'pred_gen': 2, 'pred_real': 2,
+                             'real_matches_target': True, 'real_target_prob': 0.99,
+                             'per_organ_abs_err_hu': {'liver': f}}}
+            for i, (f, p, m, a) in enumerate(zip(feat, prob, match, agree))]
+
+
+def test_variance_columns():
+    print('\nper-metric dispersion')
+    import statistics as st
+    feat = [10.0, 14.0, 18.0, 22.0]
+    s = B.summarise('demo', _phase_rows(feat, [.9, .8, .7, .6], [1, 1, 0, 1], [1, 0, 1, 1]))
+
+    # featHU is the primary metric of this benchmark and was the one column with
+    # no dispersion at all, because aggregate() returns means only.
+    check('featHU carries a sd', 'feature_l1_hu_std' in s)
+    check('featHU sd is the SAMPLE sd (ddof=1)',
+          abs(s['feature_l1_hu_std'] - st.stdev(feat)) < 1e-9,
+          f"{s['feature_l1_hu_std']:.4f} vs {st.stdev(feat):.4f}")
+    check('pixel columns are sample sd too',
+          abs(s['psnr_std'] - st.stdev([30., 31., 32., 33.])) < 1e-9)
+    check('gen_prob carries a sd',
+          abs(s['gen_prob_std'] - st.stdev([.9, .8, .7, .6])) < 1e-9)
+    # A rate's sd is sqrt(p(1-p)) — fixed by the mean, so it would print
+    # '1.00 ± 0.00' for every converged model and say nothing. SE depends on n.
+    check('phase rate reports binomial SE, not sd',
+          abs(s['phase_acc_std'] - math.sqrt(.75 * .25 / 4)) < 1e-9,
+          f"{s['phase_acc_std']:.4f}")
+    check('a single case yields NaN sd, not a fake 0.0',
+          math.isnan(B.summarise('one', _phase_rows([12.0], [.9], [1], [1]))['feature_l1_hu_std']))
+
+    out = []
+    B._category_table('demo', [('n', 'n', '{:d}', None),
+                               ('feature_l1_hu', 'featHU', '{:.2f}', 'low'),
+                               ('phase_acc', 'phase', '{:.2f}', 'high'),
+                               ('fid', 'FID', '{:.1f}', 'low')],
+                      [s, dict(s, model='other', feature_l1_hu=20.0,
+                               feature_l1_hu_std=1.0)], out)
+    txt = '\n'.join(out)
+    check('cells render as mean ± sd', '16.00** ± 5.16' in txt, txt.splitlines()[-2])
+    # Bolding the spread too would read as "best variance", a different claim.
+    check('emphasis wraps the mean only, not the ±', '± 5.16**' not in txt)
+    check('a count column gets no ±', '| 4 |' in txt)
+    check('FID has no per-case value, so no ±', '| — |' in txt)
+
+
 if __name__ == '__main__':
     print('=' * 70)
     print('BENCHMARK DISCOVERY / TILING / PAIRED TESTS')
@@ -332,6 +385,7 @@ if __name__ == '__main__':
     test_model_family()
     test_rank_marks()
     test_master_table_categorised()
+    test_variance_columns()
     print('\n' + '=' * 70)
     if FAILS:
         print(f'FAILED ({len(FAILS)}): {", ".join(FAILS)}')
