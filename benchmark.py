@@ -666,8 +666,17 @@ def master_table(summaries: List[Dict], out: List[str], perceptual: bool = False
             # fid_rad is appended only when it was actually computed for at least
             # one model — an all-blank column for reports that never passed
             # --radimagenet_weights is noise, not information.
+            #
+            # {:.3f}, not {:.1f}: RadImageNet ResNet50's feature variance on
+            # grayscale CT runs ~80x below ImageNet InceptionV3's on the same
+            # slices (confirmed via scripts/sanity_check_radimagenet_fid.py),
+            # so FID(Rad)'s natural range sits around 0.1-0.5 rather than
+            # InceptionV3-FID's tens — at 1 decimal every model rounds to the
+            # same "0.0"/"0.1" and the real, smaller-magnitude signal (which
+            # DOES rank models in the same direction as the ImageNet column)
+            # is lost to rounding, not absent.
             if radimagenet:
-                specs = specs + [('fid_rad', 'FID(Rad)', '{:.1f}', 'low')]
+                specs = specs + [('fid_rad', 'FID(Rad)', '{:.3f}', 'low')]
         _category_table(title, specs, summaries, out)
 
     out.append('\n**Spread.** Every cell is `mean ± sd` **across the n test cases**, sample '

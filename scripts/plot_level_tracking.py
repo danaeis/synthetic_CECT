@@ -50,16 +50,21 @@ def main():
             ok = np.isfinite(real) & np.isfinite(gen)
             real, gen = real[ok], gen[ok]
             stats = data['organs'][organ]
+            # audit_enhancement.py's --out JSON keeps beta ('slope') and r2 per
+            # organ but never writes the fit's intercept, only the raw real_hu/
+            # gen_hu arrays it was computed from — refit here rather than assume
+            # a key that was never saved.
             beta, r2 = stats['beta'], stats['r2']
+            intercept = float(np.polyfit(real, gen, 1)[1]) if len(real) >= 3 else float('nan')
 
             ax.scatter(real, gen, s=22, alpha=0.75, color='#b5541f', edgecolors='none')
             lo, hi = min(real.min(), gen.min()), max(real.max(), gen.max())
             pad = 0.06 * (hi - lo if hi > lo else 1)
             lo, hi = lo - pad, hi + pad
             ax.plot([lo, hi], [lo, hi], '--', color='#a89c82', lw=1, label='y=x (beta=1)')
-            if np.isfinite(beta):
+            if np.isfinite(beta) and np.isfinite(intercept):
                 xs = np.array([lo, hi])
-                ax.plot(xs, stats['intercept'] + beta * xs, '-', color='#3a4249', lw=1.5,
+                ax.plot(xs, intercept + beta * xs, '-', color='#3a4249', lw=1.5,
                        label=f'fit (beta={beta:.2f})')
             ax.set_xlim(lo, hi); ax.set_ylim(lo, hi)
             ax.set_aspect('equal')
