@@ -250,6 +250,11 @@ def score_model(name: str, manifest: Path, ev: PhaseEvaluator,
         # see perceptual.py for why they are secondary to RAPS/gradW1.
         lp = (scorer.add_case(name, c['real_path'], g01, r01, bmask)
               if scorer is not None else float('nan'))
+        # RadImageNet cosine-distance analogue — NOT LPIPS (no learned human-
+        # judgment calibration exists for this backbone; see perceptual.py).
+        # NaN whenever --radimagenet_weights was not given.
+        rad_dist = (scorer.case_rad_dist(g01, r01, bmask)
+                   if (scorer is not None and scorer.radimagenet_backend) else float('nan'))
 
         # Phase fidelity: the evaluator handles HU internally.
         ph = ev.score_case(gen, real, mask, tp, hu_min=hu_min, hu_max=hu_max,
@@ -290,6 +295,7 @@ def score_model(name: str, manifest: Path, ev: PhaseEvaluator,
             **tx,          # raps_hf, grad_w1, org_grad_w1
             **cs,          # seam, zflicker
             'lpips': lp,
+            'rad_dist': rad_dist,
             'phase_match': int(ph['gen_matches_target']),
             'agree_real': int(ph['gen_matches_real']),
             'gen_prob': ph['gen_target_prob'],
@@ -331,7 +337,7 @@ def summarise(name: str, rows: List[Dict]) -> Dict:
              'org_psnr', 'org_ssim', 'org_mae', 'org_mse', 'org_pcc',
              'body_psnr', 'body_ssim', 'body_mae', 'body_frac',
              'raps_hf', 'grad_w1', 'org_grad_w1', 'seam', 'zflicker', 'zaniso',
-             'lpips']
+             'lpips', 'rad_dist']
     out = {'model': name, 'n': len(rows)}
     for k in pixel:
         out[k] = _nanmean([r.get(k) for r in rows])
@@ -432,6 +438,11 @@ PAIRED_METRICS = [
 # FID is a per-model distributional score with no per-case value and therefore has
 # no paired test at all — that is a property of the metric, not an omission.
 LPIPS_PAIRED = [('lpips', True, None, 'lpips')]
+
+# Appended only when --radimagenet_weights was used. rad_dist is paired and
+# per-case like LPIPS (same reasoning); fid_rad is distributional like FID and
+# gets no paired test for the same reason FID doesn't.
+RAD_DIST_PAIRED = [('rad_dist', True, None, 'rad_dist')]
 
 
 def paired_block(all_rows: Dict[str, List[Dict]], base: str, out: List[str],
@@ -675,8 +686,13 @@ def master_table(summaries: List[Dict], out: List[str], perceptual: bool = False
             # same "0.0"/"0.1" and the real, smaller-magnitude signal (which
             # DOES rank models in the same direction as the ImageNet column)
             # is lost to rounding, not absent.
+            #
+            # rad_dist sits next to lpips (both paired, per-case), fid_rad next
+            # to fid (both distributional) — grouped by kind, not by backbone.
             if radimagenet:
-                specs = specs + [('fid_rad', 'FID(Rad)', '{:.3f}', 'low')]
+                lpips_spec, fid_spec = specs
+                specs = [lpips_spec, ('rad_dist', 'RadDist', '{:.4f}', 'low'),
+                        fid_spec, ('fid_rad', 'FID(Rad)', '{:.3f}', 'low')]
         _category_table(title, specs, summaries, out)
 
     out.append('\n**Spread.** Every cell is `mean ± sd` **across the n test cases**, sample '
@@ -752,7 +768,19 @@ def master_table(summaries: List[Dict], out: List[str], perceptual: bool = False
             f'RadImageNet-based FID rankings were MORE volatile and LESS aligned '
             f'with human judgment than ImageNet-based ones in their tests. Treat '
             f'FID(Rad) as one more comparability column, not a more-trustworthy '
-            f'replacement for FID or for RAPS/gradW1. Backend: {radimagenet_backend}.')
+            f'replacement for FID or for RAPS/gradW1. Its natural range runs far '
+            f'below ImageNet-FID\'s (RadImageNet ResNet50 feature variance on this '
+            f'CT domain measures ~80x below InceptionV3\'s on identical slices — '
+            f'see `scripts/sanity_check_radimagenet_fid.py`), so read the extra '
+            f'decimal places; a value that looks flat at one decimal usually is not. '
+            f'Backend: {radimagenet_backend}.\n\n'
+            f'**RadDist** — a per-case, paired cosine DISTANCE between RadImageNet '
+            f'ResNet50 embeddings of gen vs real (lower is better). This is **not** '
+            f'a "RadImageNet-LPIPS": LPIPS\'s defining feature is a linear layer '
+            f'calibrated against human 2AFC judgments, and no such calibration '
+            f'exists for this backbone. RadDist is the uncalibrated distance alone '
+            f'— a weaker, different claim than LPIPS, reported under its own name '
+            f'so the two are never read as comparable numbers.')
     out.append('\n**Caveat:** external models retrained on this data at this scale do not '
                'reproduce their papers\' reported numbers — this is a controlled same-data, '
                'same-split comparison, not a reproduction. PSNR/SSIM reward blur here (see '
@@ -989,13 +1017,15 @@ def main():
                     help='torch device for FID/LPIPS (default: cuda if available)')
     ap.add_argument('--radimagenet_weights', type=Path, default=None,
                     help='path to a local RadImageNet ResNet50 PyTorch state_dict '
-                         '(.pt/.pth); adds a second, RadImageNet-backbone FID '
-                         'column (fid_rad) alongside the ImageNet one. Requires '
+                         '(.pt/.pth); adds a RadImageNet-backbone FID column '
+                         '(fid_rad) alongside the ImageNet one, plus a paired '
+                         'per-case cosine-distance column (rad_dist). Requires '
                          '--perceptual. See perceptual.py module docstring for '
                          'where to get the weights and the caveat on how much '
-                         'this backbone is actually validated for FID. No '
-                         'RadImageNet-LPIPS is computed (no published linear '
-                         'calibration for that backbone).')
+                         'this backbone is actually validated for FID. rad_dist '
+                         'is NOT "RadImageNet-LPIPS" — no published linear '
+                         'calibration against human judgment exists for this '
+                         'backbone, so it is an uncalibrated distance, not LPIPS.')
     ap.add_argument('--min_body_frac', type=float, default=0.02,
                     help='skip axial slices whose body mask covers less than this '
                          'fraction of the frame; near-empty air slices are identical '
@@ -1202,9 +1232,11 @@ def main():
         # this invocation was not given the flag.
         have_lpips = any(_finite(r.get('lpips'))
                          for rows in all_rows.values() for r in rows)
-        paired_block(all_rows, base, lines,
-                     metrics=(PAIRED_METRICS + LPIPS_PAIRED if have_lpips
-                              else PAIRED_METRICS))
+        have_rad_dist = any(_finite(r.get('rad_dist'))
+                            for rows in all_rows.values() for r in rows)
+        extra_metrics = ((LPIPS_PAIRED if have_lpips else [])
+                        + (RAD_DIST_PAIRED if have_rad_dist else []))
+        paired_block(all_rows, base, lines, metrics=PAIRED_METRICS + extra_metrics)
     if not (args.no_store or args.fresh):
         lines.append(f'\n_Table built from {len(summaries)} model(s) accumulated in '
                      f'`{store}` ({len(fresh)} scored in this run). Each model is '

@@ -77,12 +77,15 @@ upgrade, just a different, also-imperfect proxy that the NCCT→CECT literature
 increasingly reports. `fid_rad` is included for that comparability, not because
 it is known to be the more valid number.
 
-No `RadImageNet-LPIPS` is computed. LPIPS is not "any backbone's features plus a
-distance" — it is a backbone's features plus a LINEAR CALIBRATION LAYER trained
-to match human 2AFC perceptual judgments (`richzhang/PerceptualSimilarity`), and
-no such calibration has been published for a RadImageNet backbone. A cosine or L2
-distance in RadImageNet feature space is a different, uncalibrated metric and
-would be mislabeled if reported as "LPIPS".
+No `RadImageNet-LPIPS` is computed, and `rad_dist` (below) is not one. LPIPS is
+not "any backbone's features plus a distance" — it is a backbone's features plus
+a LINEAR CALIBRATION LAYER trained to match human 2AFC perceptual judgments
+(`richzhang/PerceptualSimilarity`), and no such calibration has been published
+for a RadImageNet backbone. What `case_rad_dist` reports instead is the honest,
+weaker claim: mean cosine DISTANCE between RadImageNet ResNet50 embeddings,
+uncalibrated, paired per-case like LPIPS. Report it as "RadDist" or similar, and
+never as "RadImageNet-LPIPS" or beside LPIPS as if the two numbers meant the
+same kind of thing.
 
 The RadImageNet weights are not fetched by this code. Point `--radimagenet_weights`
 at a local PyTorch state_dict (`.pt`/`.pth`) — official source:
@@ -375,6 +378,37 @@ class PerceptualScorer:
                 b = rs[i:i + self.batch_size].to(self.device) * 2 - 1
                 vals.append(self._lpips(a, b).flatten().cpu().numpy())
         return float(np.concatenate(vals).mean()) if vals else float('nan')
+
+    def case_rad_dist(self, g01: np.ndarray, r01: np.ndarray, bmask: np.ndarray) -> float:
+        """Mean cosine DISTANCE (1 - cosine similarity) between RadImageNet
+        ResNet50 features of gen vs real, over a case's body-containing axial
+        slices. NaN if --radimagenet_weights was not given.
+
+        This is NOT a RadImageNet-LPIPS. LPIPS's defining feature is not "some
+        backbone's activations" but a LINEAR CALIBRATION on top of them, fit to
+        ~150K human two-alternative-forced-choice judgments (Zhang et al. 2018)
+        — no such calibration exists for a RadImageNet backbone, so there is no
+        way to compute a comparable number. This is the honest fallback: a
+        plain, uncalibrated distance in the pooled 2048-d embedding, reported
+        under its own name so it is never conflated with real LPIPS in a table.
+
+        Cosine, not L2: RadImageNet's raw feature scale runs ~80x below
+        ImageNet's on grayscale CT (see scripts/sanity_check_radimagenet_fid.py),
+        so an L2 distance would carry that same scale distortion. Cosine
+        distance is scale-invariant and bounded [0, 2], which keeps it legible
+        on its own terms.
+        """
+        if 'radimagenet' not in self._backbones:
+            return float('nan')
+        idx = self._select(bmask)
+        fg = self._features(g01, idx, 'radimagenet')
+        fr = self._features(r01, idx, 'radimagenet')
+        if fg.shape[0] == 0:
+            return float('nan')
+        ng = fg / (np.linalg.norm(fg, axis=1, keepdims=True) + 1e-8)
+        nr = fr / (np.linalg.norm(fr, axis=1, keepdims=True) + 1e-8)
+        cos_sim = (ng * nr).sum(axis=1)
+        return float(np.mean(1.0 - cos_sim))
 
     def _features(self, vol01: np.ndarray, idx: np.ndarray, backbone: str) -> np.ndarray:
         st = self._stack(vol01, idx)
