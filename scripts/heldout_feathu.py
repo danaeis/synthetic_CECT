@@ -35,18 +35,35 @@ import numpy as np
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--report', type=Path, required=True,
-                    help='phase_eval_report.json')
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument('--report', type=Path,
+                     help='phase_eval_report.json')
+    # benchmark.py already stores each case's `_phase_case`, which carries the
+    # same per_organ_abs_err_hu this script needs — so a model that has been
+    # through benchmark.py needs no separate phase_eval.py run (and therefore no
+    # importable TotalSegmentator, which phase_eval.py's CLI otherwise requires
+    # to resolve its organ-label map).
+    src.add_argument('--store', type=Path,
+                     help='benchmark.py store entry, e.g. '
+                          'analysis/bench_ncct2cect/store/level_all8_oracle_b8f18d12.json')
     ap.add_argument('--cond_organs', nargs='*', default=None,
                     help='conditioned organs to exclude; default reads '
                          'cond_organs from the run_config.json beside the report')
     ap.add_argument('--out', type=Path, default=None)
     a = ap.parse_args()
 
-    rep = json.loads(a.report.read_text())
-    cases = rep.get('per_case') or rep.get('cases') or []
-    if not cases:
-        raise SystemExit(f"no per-case entries in {a.report}")
+    if a.store:
+        entry = json.loads(a.store.read_text())
+        cases = [r['_phase_case'] for r in entry.get('rows', [])
+                 if isinstance(r.get('_phase_case'), dict)]
+        if not cases:
+            raise SystemExit(f"no _phase_case entries in {a.store}")
+        a.report = a.store        # for the run_config lookup below
+    else:
+        rep = json.loads(a.report.read_text())
+        cases = rep.get('per_case') or rep.get('cases') or []
+        if not cases:
+            raise SystemExit(f"no per-case entries in {a.report}")
 
     cond = a.cond_organs
     if cond is None:
