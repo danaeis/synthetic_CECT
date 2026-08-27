@@ -566,6 +566,15 @@ def model_family(name: str) -> str:
     base = name.split('/')[0].lower()
     if base.startswith('identity'):
         return 'Reference / floor'
+    # An oracle arm reads its conditioning off the REAL CECT (infer_volume.py's
+    # --level_mode oracle), so its featHU/beta-lev are partly circular: featHU IS
+    # per-organ median-HU error and the oracle was handed those very medians.
+    # Without this, such a row competes for — and wins — the bold "best" mark on
+    # exactly the columns it leaked, which is the one thing infer_volume.py's own
+    # comment says it must never be ("can never be a headline number on its own").
+    # Reference/floor rows are shown for scale but excluded from ranking.
+    if 'oracle' in base:
+        return 'Reference / floor'
     # External check BEFORE the diffusion check: SynDiff is both (an external
     # repo whose model happens to be a diffusion architecture), and "External
     # baseline" is the more useful bucket here — it keeps that section as
