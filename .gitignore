@@ -23,3 +23,5 @@ develope/
 
 # Recurring rsync artifact: a relative destination clones the repo into itself.
 synthetic_CECT/
+analysis/
+

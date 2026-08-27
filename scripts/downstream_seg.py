@@ -333,7 +333,7 @@ def run_totalsegmentator(vol: str, seg_dir: Path, fast: bool, extra: Sequence[st
 
 
 def stage_segment(args, test_cases: Sequence[dict], split_dir: Path) -> None:
-    work = Path(args.work)
+    work = Path(args.work).resolve()
     work.mkdir(parents=True, exist_ok=True)
 
     combine = Path(args.combine_masks).resolve()
@@ -363,12 +363,43 @@ def stage_segment(args, test_cases: Sequence[dict], split_dir: Path) -> None:
 
             seg_dir = arm_dir / f"{cid}_segs"
             seg_dir.mkdir(parents=True, exist_ok=True)
-            print(f"  [{i}/{len(vols)}] {cid}: TotalSegmentator")
-            run_totalsegmentator(vol, seg_dir, args.fast, args.ts_args)
 
-            print(f"  [{i}/{len(vols)}] {cid}: combine_masks")
-            subprocess.run([sys.executable, str(combine), str(seg_dir), str(prefix)],
+            # Resume at the organ-file level too, not just the final mask.
+            # TotalSegmentator is ~100 s/volume and is by far the expensive step;
+            # if a previous attempt segmented this case but failed to combine,
+            # there is no reason to pay for it again.
+            n_organs = len(list(seg_dir.glob("*.nii.gz")))
+            if n_organs > 0 and not args.force:
+                print(f"  [{i}/{len(vols)}] {cid}: TotalSegmentator cached "
+                      f"({n_organs} organ files)")
+            else:
+                print(f"  [{i}/{len(vols)}] {cid}: TotalSegmentator")
+                run_totalsegmentator(str(Path(vol).resolve()), seg_dir,
+                                     args.fast, args.ts_args)
+
+            n_organs = len(list(seg_dir.glob("*.nii.gz")))
+            if n_organs == 0:
+                raise SystemExit(
+                    f"TotalSegmentator wrote no organ files into {seg_dir}.\n"
+                    "combine_masks.py expects one <organ>.nii.gz per organ, so a "
+                    "multi-label run (--ml) or a task other than 'total' will not "
+                    "work here. Check the TotalSegmentator invocation."
+                )
+            print(f"  [{i}/{len(vols)}] {cid}: combine_masks ({n_organs} organ files)")
+
+            # combine_masks.py runs with cwd=its own directory (that is where its
+            # pipeline_logs/ live), so BOTH paths must be absolute — a path
+            # relative to this repo would resolve against data_reg_pipeline/
+            # instead and the organ files would silently not be found.
+            subprocess.run([sys.executable, str(combine),
+                            str(seg_dir.resolve()), str(prefix.resolve())],
                            check=True, cwd=str(combine.parent))
+
+            if not out_mask.is_file():
+                raise SystemExit(
+                    f"combine_masks.py reported success but {out_mask} does not "
+                    "exist. Refusing to continue with a missing mask."
+                )
 
             if args.cleanup:
                 for f in seg_dir.glob("*.nii.gz"):
@@ -470,8 +501,8 @@ def _sig(t: float, n: int) -> str:
 
 
 def stage_score(args, test_cases: Sequence[dict], split_dir: Path) -> None:
-    work = Path(args.work)
-    out = Path(args.out)
+    work = Path(args.work).resolve()
+    out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
 
     all_rows: List[dict] = []
