@@ -531,9 +531,20 @@ def stage_score(args, test_cases: Sequence[dict], split_dir: Path) -> None:
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
 
+    metric = args.metric
+    metric_label = "eroded Dice" if metric == "eroded_dice" else "Dice"
+
+    if args.reference == "cect":
+        if not (work / "cect").is_dir():
+            raise SystemExit("--reference cect needs the 'cect' arm segmented: "
+                             f"{work/'cect'} does not exist.")
+
     all_rows: List[dict] = []
     for arm, spec in args.arms:
         vols = resolve_arm_volumes(arm, spec, test_cases, split_dir)
+        if args.reference == "cect":
+            vols = [(cid, vol, str(work / "cect" / f"{cid}_seg_full.nii.gz"))
+                    for cid, vol, _ref in vols]
         print(f"\n=== scoring arm '{arm}'")
         all_rows.extend(score_arm(arm, vols, work))
 
@@ -550,11 +561,27 @@ def stage_score(args, test_cases: Sequence[dict], split_dir: Path) -> None:
     arms = [a for a, _ in args.arms]
     lines: List[str] = []
     lines.append("# Downstream multi-organ segmentation — does synthesis close the gap?\n")
-    lines.append("Reference: TotalSegmentator on the REAL CECT (the stored `_seg_full` masks). "
+    ref_desc = ("the stored `_seg_full` masks shipped with the split"
+                if args.reference == "stored" else
+                "THIS environment's TotalSegmentator run on the real CECT "
+                "(the `cect` arm), so no version or resampling offset separates the "
+                "reference from the arms")
+    lines.append(f"Reference: TotalSegmentator on the REAL CECT — {ref_desc}. "
                  "Every arm is scored against it on the same test cases and the same voxel "
-                 "grid. Eroded Dice uses 6 mm erosion, matching the registration chapter.\n")
+                 f"grid. Tables report **{metric_label}**"
+                 + (" (6 mm erosion, matching the registration chapter)."
+                    if metric == "eroded_dice" else ".") + "\n")
+    if metric == "eroded_dice":
+        lines.append("6 mm erosion removes a 6 mm shell from structures whose radius is "
+                     "often smaller than that, so the iliac vessels and the portal vein "
+                     "read near zero here while their plain Dice is 0.7-0.8. Re-run with "
+                     "`--metric dice` to read the vascular rows.\n")
 
-    if "cect" in arms:
+    if "cect" in arms and args.reference == "cect":
+        lines.append("\n**Integrity check: not applicable.** With `--reference cect` the "
+                     "`cect` arm is scored against itself and is 1.0 by construction. The "
+                     "offset it would have measured is instead removed from every arm.\n")
+    elif "cect" in arms:
         c = _nanmean([r["dice"] for r in all_rows if r["arm"] == "cect"])
         if c > 0.999:
             verdict = "PASS — the installed TotalSegmentator reproduces the reference masks."
@@ -596,7 +623,7 @@ def stage_score(args, test_cases: Sequence[dict], split_dir: Path) -> None:
     for g in GROUPS:
         cells = []
         for a in arms:
-            v = _nanmean([r["eroded_dice"] for r in all_rows
+            v = _nanmean([r[metric] for r in all_rows
                           if r["arm"] == a and r["group"] == g])
             cells.append(f"{v:.4f}" if np.isfinite(v) else "—")
         lines.append(f"| {g} | " + " | ".join(cells) + " |")
@@ -612,7 +639,7 @@ def stage_score(args, test_cases: Sequence[dict], split_dir: Path) -> None:
     for lab, name in sorted(LABEL_NAME.items(), key=lambda kv: (LABEL_GROUP[kv[0]], kv[1])):
         cells = []
         for a in arms:
-            v = _nanmean([r["eroded_dice"] for r in all_rows
+            v = _nanmean([r[metric] for r in all_rows
                           if r["arm"] == a and r["label"] == lab])
             cells.append(f"{v:.4f}" if np.isfinite(v) else "—")
         if all(c == "—" for c in cells):
@@ -621,25 +648,44 @@ def stage_score(args, test_cases: Sequence[dict], split_dir: Path) -> None:
 
     # ---- gap closed ------------------------------------------------------
     if "ncct" in arms:
+        # The ceiling is the `cect` arm when it exists, NOT 1.0. Segmenting the
+        # real CECT does not reproduce the stored masks exactly (resampling of
+        # the reference onto the aligned grid, plus any TotalSegmentator version
+        # difference), and that offset applies to every arm equally. Normalising
+        # by 1.0 would divide the achievable headroom by ~4 and make a model that
+        # fully closes the gap report ~19%.
+        has_ceiling = "cect" in arms
         lines.append("\n## Fraction of the gap closed\n")
-        lines.append("Per group: `(arm - ncct) / (1.0 - ncct)`, where 1.0 is the reference "
-                     "by construction. 0% = no better than segmenting the non-contrast scan "
-                     "directly; 100% = indistinguishable from segmenting the real CECT.\n")
+        lines.append("Per group: `(arm - ncct) / (ceiling - ncct)`. 0% = no better than "
+                     "segmenting the non-contrast scan directly; 100% = indistinguishable "
+                     "from segmenting the real CECT. The ceiling is "
+                     + ("the `cect` arm — segmenting the real CECT in this environment — "
+                        "which is the highest score any arm can reach here.\n"
+                        if has_ceiling else
+                        "1.0, because no `cect` arm was scored. Add `--arm cect`: without "
+                        "it the denominator is wrong and every percentage is understated.\n"))
         others = [a for a in arms if a not in RESERVED_ARMS]
-        lines.append("| group | ncct Dice | " + " | ".join(others) + " |")
-        lines.append("|---" * (len(others) + 2) + "|")
+        lines.append("| group | ncct | ceiling | headroom | " + " | ".join(others) + " |")
+        lines.append("|---" * (len(others) + 4) + "|")
         for g in GROUPS:
-            base = _nanmean([r["eroded_dice"] for r in all_rows
+            base = _nanmean([r[metric] for r in all_rows
                              if r["arm"] == "ncct" and r["group"] == g])
+            top = (_nanmean([r[metric] for r in all_rows
+                             if r["arm"] == "cect" and r["group"] == g])
+                   if has_ceiling else 1.0)
             cells = []
             for a in others:
-                v = _nanmean([r["eroded_dice"] for r in all_rows
+                v = _nanmean([r[metric] for r in all_rows
                               if r["arm"] == a and r["group"] == g])
-                if np.isfinite(v) and np.isfinite(base) and base < 1.0:
-                    cells.append(f"{100.0 * (v - base) / (1.0 - base):+.1f}%")
+                if np.isfinite(v) and np.isfinite(base) and np.isfinite(top) and top > base:
+                    cells.append(f"{100.0 * (v - base) / (top - base):+.1f}%")
                 else:
                     cells.append("—")
-            lines.append(f"| {g} | {base:.4f} | " + " | ".join(cells) + " |")
+            head = f"{top - base:+.4f}" if np.isfinite(top) and np.isfinite(base) else "—"
+            lines.append(f"| {g} | {base:.4f} | {top:.4f} | {head} | " + " | ".join(cells) + " |")
+        lines.append("\n`headroom` is what is actually there to win. Where it is a few "
+                     "thousandths — the skeletal and muscular rows — the percentage column "
+                     "is a ratio of two noise terms and must not be read as a result.\n")
 
         # ---- paired tests vs ncct ---------------------------------------
         lines.append("\n## Paired per-case tests vs the `ncct` arm (positive = better)\n")
@@ -650,12 +696,12 @@ def stage_score(args, test_cases: Sequence[dict], split_dir: Path) -> None:
                 pa: Dict[str, List[float]] = defaultdict(list)
                 pb: Dict[str, List[float]] = defaultdict(list)
                 for r in all_rows:
-                    if r["group"] != g or r["eroded_dice"] is None:
+                    if r["group"] != g or r[metric] is None:
                         continue
                     if r["arm"] == a:
-                        pa[r["case_id"]].append(r["eroded_dice"])
+                        pa[r["case_id"]].append(r[metric])
                     elif r["arm"] == "ncct":
-                        pb[r["case_id"]].append(r["eroded_dice"])
+                        pb[r["case_id"]].append(r[metric])
                 ma = {k: float(np.mean(v)) for k, v in pa.items() if v}
                 mb = {k: float(np.mean(v)) for k, v in pb.items() if v}
                 delta, t, nb, n = _paired_test(ma, mb)
@@ -703,6 +749,17 @@ def main() -> None:
     ap.add_argument("--arm", action="append", dest="arm_specs", default=[],
                     metavar="NAME[=MANIFEST]",
                     help="repeatable; 'ncct' and 'cect' read from split.json")
+    ap.add_argument("--reference", choices=["stored", "cect"], default="stored",
+                    help="'stored' scores against the _seg_full masks shipped with "
+                         "the split. 'cect' scores against THIS environment's "
+                         "TotalSegmentator run on the real CECT (the 'cect' arm), "
+                         "which removes any offset between the two — use it when "
+                         "the integrity check does not return 1.0.")
+    ap.add_argument("--metric", choices=["eroded_dice", "dice"], default="eroded_dice",
+                    help="metric for the summary tables. 6 mm erosion matches the "
+                         "registration chapter but is near-degenerate on vessels "
+                         "thinner than ~12 mm (iliacs, portal vein) — use 'dice' "
+                         "to read those.")
     ap.add_argument("--ts_label_map", default=str(here / DEFAULT_TS_LABEL_MAP),
                     help="name->id map the reference _seg_full masks use "
                          "(config.py:TS_LABEL_MAP_JSON)")
