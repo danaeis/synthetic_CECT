@@ -105,49 +105,75 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# Organ groups. Labels and names are the _seg_full convention defined by
-# data_reg_pipeline/segmentation/combine_masks.py:LABEL_MAP — the same file that
-# produced the reference masks. Keep in sync with it.
+# Organ groups.
+#
+# The stored `_seg_full` reference masks are in NATIVE TotalSegmentator
+# numbering — the full 117-class map at config.py:TS_LABEL_MAP_JSON, the same
+# ids resolve_organ_weights() and every per-organ metric in this repo already
+# read. Groups are therefore keyed by NAME and resolved to ids through that map
+# at run time, so a TotalSegmentator version bump fails loudly here instead of
+# silently scoring the wrong anatomy. The path is duplicated rather than
+# imported because config.py imports torch and the score stage must run on a
+# CPU-only host — keep it in sync with config.py:TS_LABEL_MAP_JSON.
+#
+# Do NOT hardcode the COMPACT ids that data_reg_pipeline/segmentation/
+# combine_masks.py assigns (liver=1, spleen=2, aorta=13, ...). That is a
+# DIFFERENT label space from the reference masks. Scoring a combine_masks mask
+# against a native-id reference gives Dice = 0 for every organ except
+# kidney_left, which is id 3 in both maps by coincidence. That is what the first
+# run of this script reported, and its integrity check blamed the installed
+# TotalSegmentator for what was actually a label-space mismatch.
 # ---------------------------------------------------------------------------
 
-PARENCHYMAL: Dict[int, str] = {
-    1: "liver", 2: "spleen", 3: "kidney_left", 4: "kidney_right",
-    5: "pancreas", 6: "gallbladder",
+DEFAULT_TS_LABEL_MAP = "orgFeatXGB_CTPhase/retrain_out_full/ts_label_map_total.json"
+
+GROUP_NAMES: Dict[str, List[str]] = {
+    "parenchymal": ["liver", "spleen", "kidney_left", "kidney_right",
+                    "pancreas", "gallbladder"],
+    "vascular":    ["aorta", "inferior_vena_cava",
+                    "portal_vein_and_splenic_vein",
+                    "iliac_artery_left", "iliac_artery_right",
+                    "iliac_vena_left", "iliac_vena_right"],
+    "muscular":    ["autochthon_left", "autochthon_right",
+                    "iliopsoas_left", "iliopsoas_right"],
+    # The negative control. Bone is visible identically with and without
+    # contrast, so any Dice deficit here is NOT a contrast effect.
+    "skeletal":    ["vertebrae_L1", "vertebrae_L2", "vertebrae_L3",
+                    "vertebrae_L4", "vertebrae_L5",
+                    "vertebrae_T10", "vertebrae_T11", "vertebrae_T12",
+                    "sacrum", "hip_left", "hip_right"],
 }
 
-VASCULAR: Dict[int, str] = {
-    13: "aorta", 14: "inferior_vena_cava", 15: "portal_vein_and_splenic_vein",
-    16: "iliac_artery_left", 17: "iliac_artery_right",
-    18: "iliac_vena_left", 19: "iliac_vena_right",
-}
-
-MUSCULAR: Dict[int, str] = {
-    7: "autochthon_left", 8: "autochthon_right",
-    9: "iliopsoas_left", 10: "iliopsoas_right",
-}
-
-# The negative control. Bone is visible identically with and without contrast,
-# so any Dice deficit here is NOT a contrast effect.
-SKELETAL: Dict[int, str] = {
-    21: "vertebrae_L1", 22: "vertebrae_L2", 23: "vertebrae_L3",
-    24: "vertebrae_L4", 25: "vertebrae_L5",
-    26: "vertebrae_T10", 27: "vertebrae_T11", 28: "vertebrae_T12",
-    38: "sacrum", 41: "hip_left", 42: "hip_right",
-}
-
-GROUPS: Dict[str, Dict[int, str]] = {
-    "parenchymal": PARENCHYMAL,
-    "vascular": VASCULAR,
-    "muscular": MUSCULAR,
-    "skeletal": SKELETAL,
-}
-
+# Filled by init_labels(); GROUPS keeps the group order above.
+GROUPS: Dict[str, Dict[int, str]] = {g: {} for g in GROUP_NAMES}
 LABEL_NAME: Dict[int, str] = {}
 LABEL_GROUP: Dict[int, str] = {}
-for _g, _m in GROUPS.items():
-    for _lab, _nm in _m.items():
-        LABEL_NAME[_lab] = _nm
-        LABEL_GROUP[_lab] = _g
+
+
+def init_labels(ts_label_map: str) -> None:
+    """Resolve GROUP_NAMES to TotalSegmentator ids. Must run before scoring."""
+    p = Path(ts_label_map)
+    if not p.is_file():
+        raise SystemExit(
+            f"TotalSegmentator label map not found: {p}\n"
+            "It is the name->id map the reference _seg_full masks are numbered "
+            "with (config.py:TS_LABEL_MAP_JSON). Regenerate it with:\n"
+            "  python orgFeatXGB_CTPhase/dump_ts_label_map.py")
+    name_to_id = json.loads(p.read_text())
+    missing = sorted({n for names in GROUP_NAMES.values()
+                      for n in names if n not in name_to_id})
+    if missing:
+        raise SystemExit(
+            f"these organs are not in {p}: {missing}\n"
+            "The installed TotalSegmentator names its classes differently from "
+            "the one that produced the reference masks. Fix that before scoring.")
+    for g, names in GROUP_NAMES.items():
+        for n in names:
+            lab = int(name_to_id[n])
+            GROUPS[g][lab] = n
+            LABEL_NAME[lab] = n
+            LABEL_GROUP[lab] = g
+
 
 EROSION_MM = 6.0          # matches evaluate_pipeline/config.py:EROSION_MM
 RESERVED_ARMS = ("ncct", "cect")
@@ -530,12 +556,37 @@ def stage_score(args, test_cases: Sequence[dict], split_dir: Path) -> None:
 
     if "cect" in arms:
         c = _nanmean([r["dice"] for r in all_rows if r["arm"] == "cect"])
-        verdict = ("PASS — the installed TotalSegmentator reproduces the reference masks."
-                   if c > 0.999 else
-                   "**FAIL** — the installed TotalSegmentator does NOT reproduce the "
-                   "reference masks. Every number below, and every organ metric elsewhere "
-                   "in this repo, is measured against a reference this environment cannot "
-                   "regenerate. Fix this before reading anything else.")
+        if c > 0.999:
+            verdict = "PASS — the installed TotalSegmentator reproduces the reference masks."
+        else:
+            # Two failure modes look identical in the mean and are told apart by
+            # the SHAPE of the per-label Dice: a version/settings difference
+            # degrades every organ a little; a label-space mismatch zeroes all
+            # of them but leaves whichever ids the two maps share intact.
+            per_lab = [(_nanmean([r["dice"] for r in all_rows
+                                  if r["arm"] == "cect" and r["label"] == lab]), lab)
+                       for lab in sorted(LABEL_NAME)]
+            per_lab = [(v, lab) for v, lab in per_lab if np.isfinite(v)]
+            n_zero = sum(1 for v, _ in per_lab if v < 0.01)
+            n_high = sum(1 for v, _ in per_lab if v > 0.8)
+            if per_lab and n_zero >= 0.5 * len(per_lab) and n_high:
+                agree = ", ".join(f"{LABEL_NAME[lab]} ({lab})"
+                                  for v, lab in per_lab if v > 0.8)
+                verdict = (
+                    "**FAIL — LABEL-SPACE MISMATCH, not a TotalSegmentator version "
+                    f"problem.** {n_zero}/{len(per_lab)} organs score Dice ~0 while "
+                    f"these score >0.8: {agree}. A degraded model loses a little Dice "
+                    "on every organ; only two different numberings produce exact zeros "
+                    "everywhere except the ids the two maps happen to share. The "
+                    "predicted masks are almost certainly in combine_masks.py's compact "
+                    "map while the reference is in native TotalSegmentator ids — rebuild "
+                    "them with scripts/rebuild_seg_native.py and re-score.")
+            else:
+                verdict = (
+                    "**FAIL** — the installed TotalSegmentator does NOT reproduce the "
+                    "reference masks. Every number below, and every organ metric elsewhere "
+                    "in this repo, is measured against a reference this environment cannot "
+                    "regenerate. Fix this before reading anything else.")
         lines.append(f"\n**Integrity check (`cect` arm): mean Dice = {c:.4f}.** {verdict}\n")
 
     # ---- per group -------------------------------------------------------
@@ -652,6 +703,9 @@ def main() -> None:
     ap.add_argument("--arm", action="append", dest="arm_specs", default=[],
                     metavar="NAME[=MANIFEST]",
                     help="repeatable; 'ncct' and 'cect' read from split.json")
+    ap.add_argument("--ts_label_map", default=str(here / DEFAULT_TS_LABEL_MAP),
+                    help="name->id map the reference _seg_full masks use "
+                         "(config.py:TS_LABEL_MAP_JSON)")
     ap.add_argument("--combine_masks", default="../data_reg_pipeline/segmentation/combine_masks.py",
                     help="path to the combine_masks.py that built the reference masks")
     ap.add_argument("--fast", action="store_true",
@@ -664,6 +718,8 @@ def main() -> None:
                     help="delete per-organ TS output after combining (saves disk)")
     ap.add_argument("--force", action="store_true", help="re-segment even if cached")
     args = ap.parse_args()
+
+    init_labels(args.ts_label_map)
 
     if not args.arm_specs:
         raise SystemExit("give at least one --arm (e.g. --arm ncct --arm ours=.../manifest.csv)")
