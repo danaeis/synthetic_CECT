@@ -157,6 +157,18 @@ def _parse():
     p.add_argument('--l1_decay_end_epoch',   type=int, default=None)
     p.add_argument('--adv_warmup_epochs',  type=int,   default=None)
     p.add_argument('--lr_disc',            type=float, default=None)
+    # Both existed in config.py but had no CLI flag, so no scenario could tune
+    # the generator/discriminator balance without editing config.py. They are the
+    # two knobs that matter when the discriminator runs away: b0_groupnorm_adv's
+    # train_adv climbed 0.24 -> 1.00 while train_disc sat flat at ~0.22, i.e. the
+    # generator was progressively losing and never recovered.
+    p.add_argument('--lambda_adv',         type=float, default=None,
+                   help='weight on the adversarial generator loss (config default 2.0). '
+                        'Lower it when the discriminator overpowers the generator.')
+    p.add_argument('--disc_update_freq',   type=int,   default=None,
+                   help='discriminator steps per generator step (config default 1). '
+                        'Raise to 2 to slow the generator down, or keep 1 and lower '
+                        '--lambda_adv / --lr_disc instead.')
 
     # Loss flags: --use_X / --no_X
     for flag in ['adversarial', 'perceptual', 'feature_matching',
@@ -202,7 +214,8 @@ def _apply(cfg: dict, args) -> dict:
               'phase_cond_dim',
               'lambda_organ', 'lambda_hu_profile', 'lambda_l1_floor',
               'l1_decay_start_epoch', 'l1_decay_end_epoch',
-              'adv_warmup_epochs', 'lr_disc', 'seed', 'data_seed']:
+              'adv_warmup_epochs', 'lr_disc', 'lambda_adv', 'disc_update_freq',
+              'seed', 'data_seed']:
         v = getattr(args, k, None)
         if v is not None:
             c[k] = v

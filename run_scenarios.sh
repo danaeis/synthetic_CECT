@@ -107,6 +107,29 @@ SCENARIOS=(
   "multiphase_uncond|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --target_phases venous arterial"
   "multiphase_film|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --target_phases venous arterial --use_phase_cond"
 
+  # ── Multiphase + level conditioning, WITH a discriminator ──────────────────
+  # Why this family exists. The single-phase runs overfit before the adversarial
+  # term ever mattered: b0_groupnorm_adv's checkpoint is from epoch 1 and
+  # level_all8's from epoch 5, while adv_warmup_epochs=15 means lambda_adv was
+  # still at 7-33% of its configured value at those epochs. Multiphase doubles
+  # the volume pool (97 -> 193 pairs into the same 20000-patch budget) and the
+  # overfitting disappears: multiphase_film peaks at epoch 36-41 of 45 with a
+  # FLAT val_loss. So this is the first regime where a discriminator actually
+  # gets to run at full strength for tens of epochs.
+  #
+  # Run `python scripts/dump_levels.py --phases venous arterial` first.
+  #
+  # --epochs 70: both multiphase runs so far peaked at 36-42 out of 45, i.e.
+  # they hit the cap while still improving. --early_stop_patience 10 keeps that
+  # affordable (the old default of 30 wasted ~2/3 of each run).
+  #
+  # L0 is the no-discriminator control that already ran; L1 adds it; L2 adds
+  # 2.5-D on top. Keep L1 and L2 separate — changing two things at once is how
+  # you end up unable to attribute the result.
+  "multiphase_film_level_adv|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --target_phases venous arterial --use_phase_cond --cond_organs aorta portal_vein_and_splenic_vein inferior_vena_cava heart liver pancreas gallbladder colon --use_adversarial --use_cond_disc --use_feature_matching --generator_norm group --lambda_adv 0.5 --adv_warmup_epochs 5 --epochs 70 --early_stop_patience 10"
+  "multiphase_film_level_adv_slices11|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --target_phases venous arterial --use_phase_cond --cond_organs aorta portal_vein_and_splenic_vein inferior_vena_cava heart liver pancreas gallbladder colon --use_adversarial --use_cond_disc --use_feature_matching --generator_norm group --lambda_adv 0.5 --adv_warmup_epochs 5 --n_input_slices 11 --epochs 70 --early_stop_patience 10"
+
+  "multiphase_film_level | --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --target_phases venous arterial --use_phase_cond --cond_organs aorta portal_vein_and_splenic_vein inferior_vena_cava heart liver pancreas gallbladder colon"  
   # ── B0: the texture baseline everything below builds on ────────────────────
   # GroupNorm is the validated best (val 8.50 vs 8.86 HU at 3 seeds, ~13x the
   # 2-sigma gate). Adversarial restores texture: on the seed-42 table it is 2.1x
