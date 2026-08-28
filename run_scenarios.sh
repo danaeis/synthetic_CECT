@@ -120,14 +120,22 @@ SCENARIOS=(
   # Run `python scripts/dump_levels.py --phases venous arterial` first.
   #
   # --epochs 70: both multiphase runs so far peaked at 36-42 out of 45, i.e.
-  # they hit the cap while still improving. --early_stop_patience 10 keeps that
-  # affordable (the old default of 30 wasted ~2/3 of each run).
+  # they hit the cap while still improving.
+  #
+  # early_stop_patience is left at the config default of 30 ON PURPOSE. A first
+  # draft of these scenarios lowered it to save compute, which is exactly wrong
+  # here: config.py:507 raised it from 12 precisely because early stopping keys
+  # on val_loss (an L1 proxy), and adversarial/perceptual losses TRADE val_loss
+  # for realism — a tight patience cuts the run right as that trade-off starts
+  # to appear, which is the very thing these scenarios exist to produce. It also
+  # costs little in this regime: multiphase peaks near epoch 40, so patience 30
+  # rarely triggers before --epochs anyway.
   #
   # L0 is the no-discriminator control that already ran; L1 adds it; L2 adds
   # 2.5-D on top. Keep L1 and L2 separate — changing two things at once is how
   # you end up unable to attribute the result.
-  "multiphase_film_level_adv|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --target_phases venous arterial --use_phase_cond --cond_organs aorta portal_vein_and_splenic_vein inferior_vena_cava heart liver pancreas gallbladder colon --use_adversarial --use_cond_disc --use_feature_matching --generator_norm group --lambda_adv 0.5 --adv_warmup_epochs 5 --epochs 70 --early_stop_patience 10"
-  "multiphase_film_level_adv_slices11|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --target_phases venous arterial --use_phase_cond --cond_organs aorta portal_vein_and_splenic_vein inferior_vena_cava heart liver pancreas gallbladder colon --use_adversarial --use_cond_disc --use_feature_matching --generator_norm group --lambda_adv 0.5 --adv_warmup_epochs 5 --n_input_slices 11 --epochs 70 --early_stop_patience 10"
+  "multiphase_film_level_adv|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --target_phases venous arterial --use_phase_cond --cond_organs aorta portal_vein_and_splenic_vein inferior_vena_cava heart liver pancreas gallbladder colon --use_adversarial --use_cond_disc --use_feature_matching --generator_norm group --lambda_adv 0.5 --adv_warmup_epochs 5 --epochs 70"
+  "multiphase_film_level_adv_slices11|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --target_phases venous arterial --use_phase_cond --cond_organs aorta portal_vein_and_splenic_vein inferior_vena_cava heart liver pancreas gallbladder colon --use_adversarial --use_cond_disc --use_feature_matching --generator_norm group --lambda_adv 0.5 --adv_warmup_epochs 5 --n_input_slices 11 --epochs 70"
 
   "multiphase_film_level | --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --target_phases venous arterial --use_phase_cond --cond_organs aorta portal_vein_and_splenic_vein inferior_vena_cava heart liver pancreas gallbladder colon"  
   # ── B0: the texture baseline everything below builds on ────────────────────
