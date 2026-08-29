@@ -310,11 +310,12 @@ def run(scenario_dir: str, split: str, out_dir: str, ckpt_name: str,
     cond_organs = list(cfg.get('cond_organs') or [])
     levels_db = None
     if cond_organs:
-        if level_mode not in ('oracle', 'population', 'fixed', 'fixed_z'):
+        if level_mode not in ('oracle', 'population', 'population_phase',
+                              'fixed', 'fixed_z'):
             raise ValueError(f"unknown level_mode {level_mode!r}")
         lp = Path(cfg.get('levels_json', 'splits/levels.json'))
-        if level_mode == 'oracle' and not lp.exists():
-            raise FileNotFoundError(f"level_mode=oracle needs {lp}")
+        if level_mode in ('oracle', 'population_phase') and not lp.exists():
+            raise FileNotFoundError(f"level_mode={level_mode} needs {lp}")
         if lp.exists():
             levels_db = json.loads(lp.read_text())
         log.info(f"level conditioning: {len(cond_organs)} organ(s), mode={level_mode}"
@@ -332,12 +333,49 @@ def run(scenario_dir: str, split: str, out_dir: str, ckpt_name: str,
                     f"One HU value cannot suit {len(cond_organs)} organs with different "
                     f"ranges — use --level_mode fixed_z --level_z Z for a calibration sweep.")
 
+    # Per-phase training mean, expressed in the POOLED standardised units the
+    # model was trained with. Cached because it is identical for every case.
+    #
+    # Why this mode exists. dump_levels.py standardises over all phases pooled,
+    # so for a multiphase run `standardize.mean` is the average of venous and
+    # arterial. The aorta's pooled mean is 207 HU — the venous median is ~145 and
+    # the arterial ~294, so z=0 ('population') asks for a level that belongs to
+    # NEITHER phase. A model that faithfully obeys its level input then emits a
+    # phase-inappropriate volume and scores terribly on phase fidelity, while a
+    # model that ignores the input scores well; the metric rewards exactly the
+    # wrong thing. This asks each phase for ITS OWN training mean instead.
+    #
+    # Leak-free: it reads train-split statistics only, never the test case.
+    _phase_z_cache: Dict[str, np.ndarray] = {}
+
+    def _phase_population_z(phase: str) -> np.ndarray:
+        n = len(cond_organs)
+        if phase in _phase_z_cache:
+            return _phase_z_cache[phase]
+        st = levels_db['standardize']
+        idx = [levels_db['organs'].index(o) for o in cond_organs]
+        z = np.zeros(n, np.float32)
+        for j, o in enumerate(cond_organs):
+            vals = [rec[phase]['cect'].get(o) for rec in levels_db['cases'].values()
+                    if rec.get('split') == 'train' and phase in rec]
+            vals = [v for v in vals if v is not None and np.isfinite(v)]
+            if not vals:
+                continue                      # 0.0 == pooled mean, the old behaviour
+            mu, sd = st['mean'][idx[j]], (st['std'][idx[j]] or 1.0)
+            z[j] = (float(np.mean(vals)) - mu) / sd
+        _phase_z_cache[phase] = z
+        log.info(f"  population_phase[{phase}]: z = "
+                 + ", ".join(f"{o}={v:+.2f}" for o, v in zip(cond_organs, z)))
+        return z
+
     def _level_for(case_id: str, phase: str):
         if not cond_organs:
             return None
         n = len(cond_organs)
         if level_mode == 'population':
-            return np.zeros(n, np.float32)      # standardised mean
+            return np.zeros(n, np.float32)      # standardised mean (POOLED)
+        if level_mode == 'population_phase':
+            return _phase_population_z(phase)
         if level_mode == 'fixed_z':
             # Every organ shifted by the same number of its own SDs: z=0 is
             # exactly `population`, z=+1 is "one sd more enhanced than average".
@@ -411,10 +449,12 @@ def main():
     ap.add_argument('--out_dir', default=None, help='default: <scenario_dir>/phase_infer')
     ap.add_argument('--ckpt_name', default='best_model.pth')
     ap.add_argument('--level_mode', default='oracle',
-                    choices=['oracle', 'population', 'fixed', 'fixed_z'],
+                    choices=['oracle', 'population', 'population_phase', 'fixed', 'fixed_z'],
                     help="oracle = the case's true level (the CEILING, leaks the "
                          "target); population = training mean (must reproduce the "
-                         "unconditioned baseline); fixed = --level HU for every case; "
+                         "unconditioned baseline, but POOLED across phases); population_phase = "
+                         "each phase's own training mean (use this for a multiphase run); "
+                         "fixed = --level HU for every case; "
                          "fixed_z = --level_z standard deviations for every case. "
                          "Report the oracle-vs-population GAP, never oracle alone.")
     ap.add_argument('--level', type=float, default=None,
