@@ -272,7 +272,8 @@ def infer_volume(G: UNetGenerator, vol_dhw: np.ndarray, cfg: Dict, device: str,
 def run(scenario_dir: str, split: str, out_dir: str, ckpt_name: str,
         batch_size: int, device: str, blend: str = 'hann',
         edge_margin: int = 0, overlap: Optional[float] = None,
-        level_mode: str = 'oracle', level: Optional[float] = None):
+        level_mode: str = 'oracle', level: Optional[float] = None,
+        level_z: Optional[float] = None):
     sdir = Path(scenario_dir)
     cfg = json.loads((sdir / 'run_config.json').read_text())
     ckpt = sdir / ckpt_name
@@ -294,10 +295,22 @@ def run(scenario_dir: str, split: str, out_dir: str, ckpt_name: str,
     #   oracle      the case's true standardised level      -> the ceiling
     #   population  all zeros == the training-set mean      -> must match baseline
     #   fixed       --level L, standardised, for every case -> the deployable mode
+    #   fixed_z     --level_z Z standard deviations         -> the sweep mode
+    #
+    # WHY fixed_z EXISTS. `fixed` applies ONE HU number to EVERY conditioned
+    # organ, then standardises each by its own organ's stats. That is fine for a
+    # single-organ model (--cond_organs aorta), but for the 8-organ model those
+    # organs occupy wildly different HU ranges: with --level 350, aorta lands at
+    # a sensible z=+1.4 while gallbladder (train mean 29.2, sd 12.4) lands at
+    # z=+25.9 — an enhancement the model has never seen and cannot render.
+    # Sweeping a calibration curve that way measures the model's behaviour far
+    # outside its training distribution, not its controllability. fixed_z moves
+    # every organ by the SAME number of standard deviations instead, so each one
+    # stays in its own plausible range and the sweep tests what it means to.
     cond_organs = list(cfg.get('cond_organs') or [])
     levels_db = None
     if cond_organs:
-        if level_mode not in ('oracle', 'population', 'fixed'):
+        if level_mode not in ('oracle', 'population', 'fixed', 'fixed_z'):
             raise ValueError(f"unknown level_mode {level_mode!r}")
         lp = Path(cfg.get('levels_json', 'splits/levels.json'))
         if level_mode == 'oracle' and not lp.exists():
@@ -305,7 +318,19 @@ def run(scenario_dir: str, split: str, out_dir: str, ckpt_name: str,
         if lp.exists():
             levels_db = json.loads(lp.read_text())
         log.info(f"level conditioning: {len(cond_organs)} organ(s), mode={level_mode}"
-                 + (f", level={level}" if level_mode == 'fixed' else ""))
+                 + (f", level={level}" if level_mode == 'fixed' else "")
+                 + (f", level_z={level_z}" if level_mode == 'fixed_z' else ""))
+        if level_mode == 'fixed' and len(cond_organs) > 1:
+            st = levels_db['standardize']
+            idx = [levels_db['organs'].index(o) for o in cond_organs]
+            zs = [(level - st['mean'][i]) / (st['std'][i] or 1.0) for i in idx]
+            worst = max(range(len(zs)), key=lambda k: abs(zs[k]))
+            if abs(zs[worst]) > 4:
+                log.warning(
+                    f"--level {level} puts '{cond_organs[worst]}' at z={zs[worst]:+.1f} "
+                    f"(train mean {st['mean'][idx[worst]]:.1f}, sd {st['std'][idx[worst]]:.1f}). "
+                    f"One HU value cannot suit {len(cond_organs)} organs with different "
+                    f"ranges — use --level_mode fixed_z --level_z Z for a calibration sweep.")
 
     def _level_for(case_id: str, phase: str):
         if not cond_organs:
@@ -313,6 +338,10 @@ def run(scenario_dir: str, split: str, out_dir: str, ckpt_name: str,
         n = len(cond_organs)
         if level_mode == 'population':
             return np.zeros(n, np.float32)      # standardised mean
+        if level_mode == 'fixed_z':
+            # Every organ shifted by the same number of its own SDs: z=0 is
+            # exactly `population`, z=+1 is "one sd more enhanced than average".
+            return np.full(n, float(level_z), np.float32)
         if level_mode == 'fixed':
             st = levels_db['standardize']
             idx = [levels_db['organs'].index(o) for o in cond_organs]
@@ -382,13 +411,22 @@ def main():
     ap.add_argument('--out_dir', default=None, help='default: <scenario_dir>/phase_infer')
     ap.add_argument('--ckpt_name', default='best_model.pth')
     ap.add_argument('--level_mode', default='oracle',
-                    choices=['oracle', 'population', 'fixed'],
+                    choices=['oracle', 'population', 'fixed', 'fixed_z'],
                     help="oracle = the case's true level (the CEILING, leaks the "
                          "target); population = training mean (must reproduce the "
-                         "unconditioned baseline); fixed = --level for every case. "
+                         "unconditioned baseline); fixed = --level HU for every case; "
+                         "fixed_z = --level_z standard deviations for every case. "
                          "Report the oracle-vs-population GAP, never oracle alone.")
     ap.add_argument('--level', type=float, default=None,
-                    help='HU value for --level_mode fixed')
+                    help='HU value for --level_mode fixed. One HU number is applied '
+                         'to EVERY conditioned organ, so this only makes sense for a '
+                         'single-organ model — use fixed_z for a multi-organ sweep.')
+    ap.add_argument('--level_z', type=float, default=None,
+                    help='standard deviations from the training mean, for '
+                         '--level_mode fixed_z. Every conditioned organ is shifted by '
+                         'this many of ITS OWN sds, so all stay in range. z=0 is '
+                         'identical to --level_mode population; try -1.5 -1 0 1 1.5 '
+                         'for a calibration sweep.')
     ap.add_argument('--batch_size', type=int, default=32)
     ap.add_argument('--blend', default='hann', choices=['uniform', 'hann', 'gaussian'],
                     help="tile blend window. 'uniform' is the original flat average "
@@ -407,7 +445,7 @@ def main():
     out_dir = args.out_dir or str(Path(args.scenario_dir) / 'phase_infer')
     run(args.scenario_dir, args.split, out_dir, args.ckpt_name, args.batch_size, device,
         blend=args.blend, edge_margin=args.edge_margin, overlap=args.overlap,
-        level_mode=args.level_mode, level=args.level)
+        level_mode=args.level_mode, level=args.level, level_z=args.level_z)
 
 
 if __name__ == '__main__':
