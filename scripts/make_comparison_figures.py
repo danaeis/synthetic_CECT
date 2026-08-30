@@ -11,6 +11,10 @@ are produced:
                    i.e. the rows of the main comparison table.
   * ablation    -- our own loss / capacity ablation variants vs. our method.
 
+For each set it emits one axial figure per anatomical level plus, unless
+--no-multiplane, a combined multi-view figure (axial + coronal by default; add
+sagittal via --planes) with an image row and a subtraction row per plane.
+
 Everything is driven off the SAME manifests benchmark.py already scores from
 (`<run>/phase_infer[/<phase>]/manifest.csv` under --runs_dir, plus any
 `**/manifest.csv` under --bench_dir), so a model appears in the figure exactly
@@ -255,6 +259,50 @@ def _foot_is_high(mask: np.ndarray, labels: Dict[str, int]) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Multi-plane (axial / coronal / sagittal) slice selection + extraction       #
+# --------------------------------------------------------------------------- #
+
+def choose_plane_indices(mask: np.ndarray, labels: Dict[str, int]) -> Dict[str, int]:
+    """Coronal (y along H) and sagittal (x along W) indices through the great
+    vessels/kidneys, so the reformats cut the enhancing structures. Falls back
+    to the volume mid-plane when the mask is empty."""
+    _, Hh, Ww = mask.shape
+
+    def _centroid(ids, axis, default):
+        m = np.isin(mask, ids) if ids else np.zeros_like(mask, bool)
+        if not m.any():
+            return default
+        return int(round(np.where(m)[axis].mean()))
+
+    aorta = [labels[n] for n in ('aorta',) if n in labels]
+    kidney = [labels[n] for n in ('kidney_left', 'kidney_right') if n in labels]
+    spine = [labels[n] for n in labels if n.startswith('vertebrae')]
+    y = _centroid(aorta + kidney, 1, Hh // 2)          # coronal plane (H index)
+    x = _centroid(aorta + spine, 2, Ww // 2)           # sagittal plane (W index)
+    return {'coronal': int(np.clip(y, 0, Hh - 1)),
+            'sagittal': int(np.clip(x, 0, Ww - 1))}
+
+
+def extract_plane(vol: np.ndarray, plane: str, idx: int, foot_high: bool) -> np.ndarray:
+    """Return a display-oriented 2-D slice from a (Z,H,W) volume.
+
+    axial    -> (H,W), anterior up (flipud).
+    coronal  -> (Z,W), head up (row 0 = head when foot_high).
+    sagittal -> (Z,H), head up and anterior to the left.
+    """
+    if plane == 'axial':
+        return np.flipud(vol[idx, :, :])
+    if plane == 'coronal':
+        sl = vol[:, idx, :]                             # (Z, W)
+        return sl if foot_high else np.flipud(sl)
+    if plane == 'sagittal':
+        sl = vol[:, :, idx]                             # (Z, H)
+        sl = sl if foot_high else np.flipud(sl)
+        return sl[:, ::-1]                              # anterior to the left
+    raise ValueError(f'unknown plane {plane!r}')
+
+
+# --------------------------------------------------------------------------- #
 # Rendering                                                                   #
 # --------------------------------------------------------------------------- #
 
@@ -325,6 +373,80 @@ def render_level(level_title: str, sidx: int,
     axes[0, 0].set_ylabel('image', fontsize=9)
     fig.suptitle(f'{level_title}  |  case {case_id[:24]}…  |  axial slice {sidx}',
                  fontsize=12, y=0.99)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    print(f'  [saved] {out_path}')
+
+
+def render_multiplane(planes: List[Tuple[str, int]],
+                      columns: List[Tuple[str, np.ndarray]],
+                      ncct: np.ndarray, cect: np.ndarray, foot_high: bool,
+                      win_c: float, win_w: float, diff_max: float,
+                      out_path: Path, case_id: str) -> None:
+    """One figure spanning several planes (e.g. axial + coronal): for each plane
+    an image row (NCCT | CECT | each model) over a subtraction row (CECT-NCCT
+    for NCCT, synth-CECT for models). Mirrors the paper's multi-view panel."""
+    ncols = len(columns) + 2                       # + NCCT + real CECT
+    nrows = 2 * len(planes)
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(2.2 * ncols, 2.4 * nrows),
+                             squeeze=False,
+                             gridspec_kw={'wspace': 0.02, 'hspace': 0.04})
+
+    def _img(ax, arr):
+        # aspect='auto' fills the cell: coronal/sagittal reformats have far fewer
+        # slices than in-plane pixels, so 'equal' would render a thin sliver.
+        ax.imshow(window(arr, win_c, win_w), cmap='gray', vmin=0, vmax=1,
+                  aspect='auto')
+        ax.axis('off')
+
+    def _diff(ax, arr):
+        return ax.imshow(arr, cmap='bwr', vmin=-diff_max, vmax=diff_max,
+                         aspect='auto')
+
+    im = None
+    for p, (plane, idx) in enumerate(planes):
+        r_img, r_dif = 2 * p, 2 * p + 1
+        cect_d = extract_plane(cect, plane, idx, foot_high)
+        ncct_d = extract_plane(ncct, plane, idx, foot_high) if ncct is not None else None
+
+        # Column 0: NCCT + (CECT - NCCT) enhancement target
+        if ncct_d is not None:
+            _img(axes[r_img, 0], ncct_d)
+            _diff(axes[r_dif, 0], cect_d - ncct_d)
+        else:
+            axes[r_img, 0].axis('off')
+        axes[r_dif, 0].axis('off')
+        # Column 1: real CECT reference
+        _img(axes[r_img, 1], cect_d)
+        axes[r_dif, 1].axis('off')
+        # Columns 2..: each model + (synth - real) residual
+        for j, (label, vol) in enumerate(columns, start=2):
+            syn_d = extract_plane(vol, plane, idx, foot_high)
+            _img(axes[r_img, j], syn_d)
+            im = _diff(axes[r_dif, j], syn_d - cect_d)
+            axes[r_dif, j].axis('off')
+            if p == 0:
+                axes[r_img, j].set_title(label, fontsize=10)
+        if p == 0:
+            axes[r_img, 0].set_title('NCCT', fontsize=10)
+            axes[r_img, 1].set_title('CECT (real)', fontsize=10)
+        # Plane label down the left margin (image row = name, diff row = subtraction)
+        axes[r_img, 0].set_ylabel(f'{plane}\n(image)', fontsize=9,
+                                  rotation=90, labelpad=6)
+        axes[r_img, 0].axis('on'); axes[r_img, 0].set_xticks([]); axes[r_img, 0].set_yticks([])
+        for sp in axes[r_img, 0].spines.values():
+            sp.set_visible(False)
+
+    if im is not None:
+        cbar = fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.010,
+                            pad=0.01, aspect=50)
+        cbar.set_label('HU difference', fontsize=8)
+        cbar.ax.tick_params(labelsize=7)
+
+    view = ' + '.join(pl for pl, _ in planes)
+    fig.suptitle(f'{view} views  |  case {case_id[:24]}…', fontsize=12, y=0.995)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=200, bbox_inches='tight')
     plt.close(fig)
@@ -481,6 +603,22 @@ def run_set(set_name: str, members: List[Tuple[str, str]],
                      args.win_center, args.win_width, args.diff_max,
                      out, case_id)
 
+    # Multi-plane figure (axial + coronal [+ sagittal]) — one panel, all planes.
+    if args.multiplane:
+        planes_want = [p.strip().lower() for p in args.planes.split(',') if p.strip()]
+        cs = choose_plane_indices(mask, labels)
+        axial_idx = slices.get(args.axial_level, slices['Mid-liver'])
+        idx_for = {'axial': axial_idx,
+                   'coronal': cs['coronal'], 'sagittal': cs['sagittal']}
+        foot_high = _foot_is_high(mask, labels)
+        planes = [(p, idx_for[p]) for p in planes_want if p in idx_for]
+        if planes:
+            tag = '_'.join(p for p, _ in planes)
+            out = Path(args.out_dir) / set_name / f'{set_name}_multiplane_{tag}.png'
+            render_multiplane(planes, cols, ncct, cect, foot_high,
+                              args.win_center, args.win_width, args.diff_max,
+                              out, case_id)
+
 
 # --------------------------------------------------------------------------- #
 # Main                                                                        #
@@ -515,6 +653,14 @@ def main() -> int:
                     help='display window width (HU)')
     ap.add_argument('--diff_max', type=float, default=150.0,
                     help='subtraction colormap range is +/- this (HU)')
+    ap.add_argument('--multiplane', action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help='also emit a combined multi-view figure per set')
+    ap.add_argument('--planes', default='axial,coronal',
+                    help='planes for the multi-view figure (of axial,coronal,sagittal)')
+    ap.add_argument('--axial_level', default='Mid-liver',
+                    choices=[t for t, *_ in ANATOMICAL_LEVELS],
+                    help="which anatomical level supplies the multi-view axial row")
     ap.add_argument('--list', action='store_true',
                     help='print discovered models + table family and exit')
     args = ap.parse_args()
