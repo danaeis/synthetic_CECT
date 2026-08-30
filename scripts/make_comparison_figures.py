@@ -31,21 +31,29 @@ ids, orgFeatXGB_CTPhase/retrain_out_full/ts_label_map_total.json) is used to
 find the axial slice that best represents each requested body region. If an
 organ is missing for a case, that level falls back to a fixed depth quantile.
 
+The two default sets are the PLC-Net paper tables — `comparison` = Table 3
+(published methods), `ablation` = Table 6 (generator architectures / diffusion
+arms) — so the standard invocation needs no member flags:
+
 Usage
 -----
     cd synthetic_CECT
     python scripts/make_comparison_figures.py \
         --runs_dir ../out_synthesis_train \
         --bench_dir ../bench_ncct2cect \
-        --ours l1_organ_groupnorm_s44 \
         --set both --seed 0 --out_dir analysis/figures
 
-    # visualise one explicit case / set of models:
-    python scripts/make_comparison_figures.py --case <StudyInstanceUID> \
-        --comparison "Pix2pixHD=pix2pixhd_baseline,ResViT=resvit,Ours=slices5_k2"
+    # pin PLC-Net's inference variant / phase (defaults: E=infer_best,
+    # F=infer_popphase, phase=venous):
+    python scripts/make_comparison_figures.py \
+        --plcnet_f_infer infer_best --phase venous
 
-Run `--list` to print every discovered model (and its table family) and exit,
-which is the quickest way to choose the members of each set for your paper.
+    # one explicit case / custom member list still works:
+    python scripts/make_comparison_figures.py --case <StudyInstanceUID> \
+        --comparison "Pix2pixHD=pix2pixhd,ResViT=resvit,PLC-Net (F)=plcnet_f"
+
+Run `--list` to print every model handle (paper preset + discovered) and exit.
+Override any preset path with --manifest handle=/exact/path.
 """
 
 import argparse
@@ -183,8 +191,17 @@ def discover_bench(bench_dir: Path) -> Dict[str, Path]:
             rel = m.relative_to(bench_dir)
         except ValueError:
             continue
-        name = rel.parts[0].lower()          # e.g. ResViT/results/.../manifest.csv
-        found.setdefault(name, m)            # first manifest wins per repo
+        # Two layouts coexist: <Repo>/results/vindr_nifti/... (name = repo) and a
+        # shared results/vindr_<model>_nifti/... (name = <model>). Prefer the
+        # embedded model tag so the shared-results models don't all collide on
+        # the literal 'results' directory.
+        name = rel.parts[0].lower()
+        for p in rel.parts:
+            mm = re.match(r'vindr_(.+?)_nifti$', p)
+            if mm:
+                name = mm.group(1).lower()
+                break
+        found.setdefault(name, m)            # first manifest wins per name
     return found
 
 
@@ -457,29 +474,75 @@ def render_multiplane(planes: List[Tuple[str, int]],
 # Set assembly                                                                #
 # --------------------------------------------------------------------------- #
 
-# Default membership for each figure set: display label -> discovery key.
-# Only members whose manifest is actually discovered are used, so this stays
-# valid as runs come and go. Override with --comparison / --ablation.
+# PLC-Net paper preset. `PAPER_MODELS` maps each handle to (root, relative
+# manifest path) where root is 'runs' (--runs_dir) or 'bench' (--bench_dir), so
+# the two default sets below resolve straight off --runs_dir/--bench_dir with no
+# --manifest flags. The two PLC-Net entries carry a {infer} slot filled from
+# --plcnet_e_infer / --plcnet_f_infer and a {phase} slot from --phase. Override
+# any path with --manifest handle=/exact/path, or replace whole sets with
+# --comparison / --ablation.
+PAPER_MODELS = {
+    # competing / published methods
+    'pix2pixhd':    ('runs',  'literature_baseline_pix2pixhd_baseline/phase_infer/manifest.csv'),
+    'cyclegan':     ('bench', 'CycleGAN/results/vindr_nifti/manifest.csv'),
+    'resvit':       ('bench', 'ResViT/results/vindr_nifti/manifest.csv'),
+    'cytran':       ('bench', 'CyTran/results/vindr_nifti/manifest.csv'),
+    'geagan':       ('bench', 'results/vindr_gea_gan_nifti/manifest.csv'),
+    'deagan':       ('bench', 'results/vindr_dea_gan_nifti/manifest.csv'),
+    'swinunetr':    ('bench', 'results/vindr_swinunetr_s5_nifti/manifest.csv'),
+    'transunet':    ('bench', 'results/vindr_transunet_nifti/manifest.csv'),
+    # diffusion arms
+    'ddpm_x0':      ('runs',  'literature_baseline_diff_x0/phase_infer/manifest.csv'),
+    'diff_v':       ('runs',  'literature_baseline_diff_v/phase_infer/manifest.csv'),
+    'diff_v_organ': ('runs',  'literature_baseline_diff_v_organ/phase_infer/manifest.csv'),
+    'diff_hnll':    ('runs',  'literature_baseline_diff_hetero_nll/phase_infer/manifest.csv'),
+    # UNet + PatchGAN reference points
+    'l1_only':      ('runs',  'literature_baseline_l1_only/phase_infer/manifest.csv'),
+    'l1gn':         ('runs',  'literature_baseline_l1_organ_groupnorm_s43/phase_infer/manifest.csv'),
+    # ours (proposed)
+    'plcnet_e':     ('runs',  'literature_baseline_multiphase_film_level_adv/{infer}/{phase}/manifest.csv'),
+    'plcnet_f':     ('runs',  'literature_baseline_multiphase_film_level_adv_slices11/{infer}/{phase}/manifest.csv'),
+}
+
+# Table 3 — comparison with published methods.
 DEFAULT_COMPARISON = [
-    ('Pix2pixHD', 'pix2pixhd_baseline'),
-    ('CycleGAN',  'cyclegan'),
-    ('ResViT',    'resvit'),
-    ('CyTran',    'cytran'),
-    ('TransUNet', 'transunet'),
-    ('SwinUNETR', 'swinunetr_s5'),
-    ('GEA-GAN',   'gea_gan'),
-    ('DEA-GAN',   'dea_gan'),
+    ('pix2pixHD',   'pix2pixhd'),
+    ('CycleGAN',    'cyclegan'),
+    ('ResViT',      'resvit'),
+    ('CyTran',      'cytran'),
+    ('gEa-GAN',     'geagan'),
+    ('dEa-GAN',     'deagan'),
+    ('SwinUNETR',   'swinunetr'),
+    ('TransUNet',   'transunet'),
+    ('DDPM (x0)',   'ddpm_x0'),
+    ('PLC-Net (E)', 'plcnet_e'),
+    ('PLC-Net (F)', 'plcnet_f'),
 ]
+# Table 6 — comparison with other generator architectures / diffusion arms.
 DEFAULT_ABLATION = [
-    ('L1 only',           'l1_only'),
-    ('+ adv',             'l1_adv'),
-    ('+ organ',           'l1_adv_organ'),
-    ('+ curriculum',      'l1_organ_curriculum'),
-    ('bowel-zero',        'l1_bowel_zero'),
-    ('width32',           'width32'),
-    ('width96',           'width96'),
-    ('groupnorm',         'l1_organ_groupnorm_s44'),
+    ('UNet+L1',      'l1_only'),
+    ('UNet+L1+adv',  'l1gn'),
+    ('DDPM x0',      'ddpm_x0'),
+    ('DDPM v',       'diff_v'),
+    ('DDPM v+adv',   'diff_v_organ'),
+    ('DDPM het-var', 'diff_hnll'),
+    ('PLC-Net (E)',  'plcnet_e'),
+    ('PLC-Net (F)',  'plcnet_f'),
 ]
+
+
+def resolve_paper_models(runs_dir: Path, bench_dir: Path,
+                         e_infer: str, f_infer: str, phase: str) -> Dict[str, Path]:
+    """Resolve the PAPER_MODELS registry to concrete manifest paths under the
+    given run/bench dirs. Non-existent paths are still returned (the loader warns
+    and skips), so a partially-inferred tree degrades gracefully."""
+    roots = {'runs': runs_dir, 'bench': bench_dir}
+    infer_for = {'plcnet_e': e_infer, 'plcnet_f': f_infer}
+    out: Dict[str, Path] = {}
+    for handle, (root, rel) in PAPER_MODELS.items():
+        rel = rel.format(infer=infer_for.get(handle, ''), phase=phase)
+        out[handle] = roots[root] / rel
+    return out
 
 
 def parse_spec(spec: str) -> List[Tuple[str, str]]:
@@ -637,12 +700,20 @@ def main() -> int:
                     help='extra manifest(s); repeatable')
     ap.add_argument('--set', choices=['comparison', 'ablation', 'both'],
                     default='both')
-    ap.add_argument('--ours', default='l1_organ_groupnorm_s44',
-                    help='discovery key of the proposed method (added to every set)')
+    ap.add_argument('--ours', default='',
+                    help='handle of a proposed method to append to every set; '
+                         'empty by default because the paper presets already '
+                         'list PLC-Net (E)/(F) as members')
     ap.add_argument('--comparison', default=None,
                     help='override comparison members: "Label=key,key2,..."')
     ap.add_argument('--ablation', default=None,
                     help='override ablation members: "Label=key,..."')
+    ap.add_argument('--plcnet_e_infer', default='infer_best',
+                    help='inference subfolder for PLC-Net (E)')
+    ap.add_argument('--plcnet_f_infer', default='infer_popphase',
+                    help='inference subfolder for PLC-Net (F)')
+    ap.add_argument('--phase', default='venous',
+                    help='target phase subfolder for the multiphase PLC-Net runs')
     ap.add_argument('--case', default=None,
                     help='force a case (StudyInstanceUID substring); default random')
     ap.add_argument('--seed', type=int, default=0, help='RNG seed for case pick')
@@ -666,6 +737,11 @@ def main() -> int:
     args = ap.parse_args()
 
     manifests: Dict[str, Path] = {}
+    # Paper-preset handles first, then discovery (which may add more runs under
+    # their own names), then explicit --manifest wins over everything.
+    manifests.update(resolve_paper_models(Path(args.runs_dir), Path(args.bench_dir),
+                                          args.plcnet_e_infer, args.plcnet_f_infer,
+                                          args.phase))
     manifests.update(discover_runs(Path(args.runs_dir)))
     manifests.update(discover_bench(Path(args.bench_dir)))
     for spec in args.manifest:
