@@ -1,0 +1,710 @@
+#!/usr/bin/env python3
+"""
+Qualitative comparison figures for the NCCT->CECT benchmark.
+
+Reproduces the paper-style panels (NCCT / real CECT / every model's synthetic
+CECT + subtraction maps) for a RANDOM held-out case, sampled at several
+anatomical levels (aorta & cardia, mid-liver, kidney, pelvis). Two figure sets
+are produced:
+
+  * comparison  -- the external / architecture-swap baselines vs. our method,
+                   i.e. the rows of the main comparison table.
+  * ablation    -- our own loss / capacity ablation variants vs. our method.
+
+For each set it emits one axial figure per anatomical level plus, unless
+--no-multiplane, a combined multi-view figure (axial + coronal by default; add
+sagittal via --planes) with an image row and a subtraction row per plane.
+
+Everything is driven off the SAME manifests benchmark.py already scores from
+(`<run>/phase_infer[/<phase>]/manifest.csv` under --runs_dir, plus any
+`**/manifest.csv` under --bench_dir), so a model appears in the figure exactly
+when it appears in the table. No model checkpoints are loaded and no torch is
+imported: we only read the NIfTI volumes the manifests point at.
+
+Manifest columns (see infer_volume.py): gen_path, real_path, mask_path,
+target_phase. The NCCT source is not stored in the manifest but lives in the
+same case directory as real_path (the registered `_deeds` volumes share a grid),
+so it is recovered by globbing that directory.
+
+Slice selection is anatomy-aware: the segmentation mask (TotalSegmentator label
+ids, orgFeatXGB_CTPhase/retrain_out_full/ts_label_map_total.json) is used to
+find the axial slice that best represents each requested body region. If an
+organ is missing for a case, that level falls back to a fixed depth quantile.
+
+Usage
+-----
+    cd synthetic_CECT
+    python scripts/make_comparison_figures.py \
+        --runs_dir ../out_synthesis_train \
+        --bench_dir ../bench_ncct2cect \
+        --ours l1_organ_groupnorm_s44 \
+        --set both --seed 0 --out_dir analysis/figures
+
+    # visualise one explicit case / set of models:
+    python scripts/make_comparison_figures.py --case <StudyInstanceUID> \
+        --comparison "Pix2pixHD=pix2pixhd_baseline,ResViT=resvit,Ours=slices5_k2"
+
+Run `--list` to print every discovered model (and its table family) and exit,
+which is the quickest way to choose the members of each set for your paper.
+"""
+
+import argparse
+import csv
+import json
+import random
+import re
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import matplotlib
+matplotlib.use('Agg')                     # headless
+import matplotlib.pyplot as plt
+import nibabel as nib
+import numpy as np
+
+_HERE = Path(__file__).resolve().parent
+_REPO = _HERE.parent
+
+# --------------------------------------------------------------------------- #
+# TotalSegmentator label ids (mirrors config.TS_LABEL_MAP_JSON).              #
+# --------------------------------------------------------------------------- #
+_LABEL_JSON = _REPO / 'orgFeatXGB_CTPhase' / 'retrain_out_full' / 'ts_label_map_total.json'
+
+
+def load_label_map() -> Dict[str, int]:
+    try:
+        return {k: int(v) for k, v in json.loads(_LABEL_JSON.read_text()).items()}
+    except Exception as e:                 # keep going with the hardcoded fallback
+        print(f'[warn] could not read {_LABEL_JSON} ({e}); using builtin ids')
+        return {'aorta': 52, 'heart': 51, 'esophagus': 15, 'stomach': 6,
+                'liver': 5, 'kidney_left': 3, 'kidney_right': 2,
+                'iliac_artery_left': 65, 'iliac_artery_right': 66,
+                'urinary_bladder': 21}
+
+
+# Each anatomical level = (title, [label names whose presence marks the level],
+# fallback depth quantile in [0,1] measured head->foot after orientation).
+# The slice chosen is the one MAXIMISING the summed area of the level's labels,
+# except pelvis which takes the LOWEST slice carrying its labels.
+ANATOMICAL_LEVELS = [
+    ('Aorta & cardia', ['heart', 'aorta', 'esophagus'], 0.20, 'max'),
+    ('Mid-liver',      ['liver'],                        0.40, 'max'),
+    ('Kidney',         ['kidney_left', 'kidney_right'],  0.55, 'max'),
+    ('Pelvis',         ['urinary_bladder', 'iliac_artery_left',
+                        'iliac_artery_right'],           0.85, 'low'),
+]
+
+# --------------------------------------------------------------------------- #
+# Volume IO (mirrors dataset._load_vol: on-disk (X,Y,Z) -> (Z,H,W) axial).    #
+# --------------------------------------------------------------------------- #
+
+def load_axial(path: str) -> np.ndarray:
+    """Return (D, H, W) float32; axis 0 is the axial (head->foot) slice axis."""
+    vol = np.asanyarray(nib.load(path).dataobj).astype(np.float32)
+    return np.transpose(vol, (2, 1, 0))
+
+
+_PHASE_KW = {
+    'non-contrast': ['noncontrast', 'non-contrast', 'pre', 'baseline',
+                     'native', 'nc', 'nce', 'noncon'],
+    'arterial':     ['arterial', 'art', 'early', 'phase1', 'p1'],
+    'venous':       ['venous', 'portal', 'pv', 'phase2', 'p2', 'late'],
+    'delayed':      ['delayed', 'delay', 'equilibrium', 'phase3', 'p3'],
+}
+
+
+def infer_phase(name: str) -> Optional[str]:
+    n = name.lower()
+    for phase, kws in _PHASE_KW.items():
+        if any(k in n for k in kws):
+            return phase
+    return None
+
+
+def find_ncct(real_path: str) -> Optional[str]:
+    """Recover the NCCT volume paired with a CECT real_path: the non-contrast
+    `_deeds` volume in the same case directory (segmentation masks excluded)."""
+    real = Path(real_path)
+    cands = [f for f in sorted(real.parent.glob('*_deeds.nii.gz'))
+             if '_seg' not in f.name and f.resolve() != real.resolve()]
+    if not cands:
+        return None
+    for f in cands:                         # prefer an explicit non-contrast tag
+        if infer_phase(f.name) == 'non-contrast':
+            return str(f)
+    return str(cands[0])                     # else the only remaining volume
+
+
+# --------------------------------------------------------------------------- #
+# Manifest discovery (mirrors benchmark.discover + the --manifest adapters).  #
+# --------------------------------------------------------------------------- #
+
+_EXTERNAL_KEYWORDS = ('pix2pixhd', 'resvit', 'resnet', 'cyclegan', 'gan_ext',
+                      'cytran', 'syndiff', 'gea_gan', 'dea_gan', 'eagan')
+
+
+def model_family(name: str) -> str:
+    base = name.split('/')[0].lower()
+    if base.startswith('identity') or 'oracle' in base:
+        return 'Reference / floor'
+    if any(k in base for k in _EXTERNAL_KEYWORDS):
+        return 'External baseline'
+    if base.startswith('diff'):
+        return 'Diffusion'
+    return 'UNet + PatchGAN (this repo)'
+
+
+def discover_runs(runs_dir: Path) -> Dict[str, Path]:
+    found: Dict[str, Path] = {}
+    if not runs_dir.is_dir():
+        return found
+    for d in sorted(runs_dir.iterdir()):
+        if not d.is_dir():
+            continue
+        name = d.name.replace('literature_baseline_', '')
+        pi = d / 'phase_infer'
+        if (pi / 'manifest.csv').exists():
+            found[name] = pi / 'manifest.csv'
+            continue
+        for m in sorted(pi.glob('*/manifest.csv')) if pi.is_dir() else []:
+            found[f'{name}/{m.parent.name}'] = m       # multi-phase: one row/phase
+    return found
+
+
+def discover_bench(bench_dir: Path) -> Dict[str, Path]:
+    """Every `**/manifest.csv` under a vendored-model repo. Model name = the repo
+    directory (the child of bench_dir on the manifest's path)."""
+    found: Dict[str, Path] = {}
+    if not bench_dir.is_dir():
+        return found
+    for m in sorted(bench_dir.glob('**/manifest.csv')):
+        try:
+            rel = m.relative_to(bench_dir)
+        except ValueError:
+            continue
+        name = rel.parts[0].lower()          # e.g. ResViT/results/.../manifest.csv
+        found.setdefault(name, m)            # first manifest wins per repo
+    return found
+
+
+def read_manifest(path: Path) -> List[Dict[str, str]]:
+    with path.open() as f:
+        return list(csv.DictReader(f))
+
+
+def case_key(real_path: str) -> str:
+    """Join key across models = resolved real CECT path (same as benchmark.py)."""
+    return str(Path(real_path).resolve())
+
+
+# --------------------------------------------------------------------------- #
+# Slice selection                                                             #
+# --------------------------------------------------------------------------- #
+
+def choose_slices(mask: np.ndarray, labels: Dict[str, int]) -> Dict[str, int]:
+    """Pick one axial index per anatomical level from the segmentation volume."""
+    D = mask.shape[0]
+    # Orient head->foot along axis 0 so depth quantiles are anatomically stable:
+    # more of the liver+heart mass sits toward one end; if the aorta/heart center
+    # of mass is past the midpoint, flip so it lands near the top (small index).
+    picks: Dict[str, int] = {}
+    for title, names, q, mode in ANATOMICAL_LEVELS:
+        ids = [labels[n] for n in names if n in labels]
+        area = np.zeros(D)
+        for i in ids:
+            area += (mask == i).sum(axis=(1, 2))
+        if area.any():
+            present = np.where(area > 0)[0]
+            if mode == 'low':                # most-inferior slice carrying label
+                # 'low' anatomically = largest axial index only if foot is at
+                # high index; use the present extremum on the side away from heart
+                idx = int(present.max()) if _foot_is_high(mask, labels) else int(present.min())
+            else:                            # slice with the most of this organ
+                idx = int(np.argmax(area))
+        else:
+            idx = int(round(q * (D - 1)))    # fallback: fixed depth quantile
+            if not _foot_is_high(mask, labels):
+                idx = (D - 1) - idx
+        picks[title] = int(np.clip(idx, 0, D - 1))
+    return picks
+
+
+_FOOT_CACHE: Dict[int, bool] = {}
+
+
+def _foot_is_high(mask: np.ndarray, labels: Dict[str, int]) -> bool:
+    """True when larger axial index == more inferior (toward the feet). Decided
+    by whether the heart's centroid sits at a smaller index than the bladder's;
+    falls back to True (nibabel's usual axial ordering for these volumes)."""
+    key = id(mask)
+    if key in _FOOT_CACHE:
+        return _FOOT_CACHE[key]
+    res = True
+    top_ids = [labels[n] for n in ('heart', 'aorta') if n in labels]
+    bot_ids = [labels[n] for n in ('urinary_bladder', 'iliac_artery_left',
+                                   'iliac_artery_right') if n in labels]
+
+    def _centroid(ids):
+        a = np.zeros(mask.shape[0])
+        for i in ids:
+            a += (mask == i).sum(axis=(1, 2))
+        return float(np.average(np.arange(mask.shape[0]), weights=a)) if a.any() else None
+
+    ct, cb = _centroid(top_ids), _centroid(bot_ids)
+    if ct is not None and cb is not None:
+        res = cb > ct
+    _FOOT_CACHE[key] = res
+    return res
+
+
+# --------------------------------------------------------------------------- #
+# Multi-plane (axial / coronal / sagittal) slice selection + extraction       #
+# --------------------------------------------------------------------------- #
+
+def choose_plane_indices(mask: np.ndarray, labels: Dict[str, int]) -> Dict[str, int]:
+    """Coronal (y along H) and sagittal (x along W) indices through the great
+    vessels/kidneys, so the reformats cut the enhancing structures. Falls back
+    to the volume mid-plane when the mask is empty."""
+    _, Hh, Ww = mask.shape
+
+    def _centroid(ids, axis, default):
+        m = np.isin(mask, ids) if ids else np.zeros_like(mask, bool)
+        if not m.any():
+            return default
+        return int(round(np.where(m)[axis].mean()))
+
+    aorta = [labels[n] for n in ('aorta',) if n in labels]
+    kidney = [labels[n] for n in ('kidney_left', 'kidney_right') if n in labels]
+    spine = [labels[n] for n in labels if n.startswith('vertebrae')]
+    y = _centroid(aorta + kidney, 1, Hh // 2)          # coronal plane (H index)
+    x = _centroid(aorta + spine, 2, Ww // 2)           # sagittal plane (W index)
+    return {'coronal': int(np.clip(y, 0, Hh - 1)),
+            'sagittal': int(np.clip(x, 0, Ww - 1))}
+
+
+def extract_plane(vol: np.ndarray, plane: str, idx: int, foot_high: bool) -> np.ndarray:
+    """Return a display-oriented 2-D slice from a (Z,H,W) volume.
+
+    axial    -> (H,W), anterior up (flipud).
+    coronal  -> (Z,W), head up (row 0 = head when foot_high).
+    sagittal -> (Z,H), head up and anterior to the left.
+    """
+    if plane == 'axial':
+        return np.flipud(vol[idx, :, :])
+    if plane == 'coronal':
+        sl = vol[:, idx, :]                             # (Z, W)
+        return sl if foot_high else np.flipud(sl)
+    if plane == 'sagittal':
+        sl = vol[:, :, idx]                             # (Z, H)
+        sl = sl if foot_high else np.flipud(sl)
+        return sl[:, ::-1]                              # anterior to the left
+    raise ValueError(f'unknown plane {plane!r}')
+
+
+# --------------------------------------------------------------------------- #
+# Rendering                                                                   #
+# --------------------------------------------------------------------------- #
+
+def to_display(sl: np.ndarray) -> np.ndarray:
+    """Orient one axial slice for radiological display (patient left on image
+    right, anterior up). np.flipud puts row 0 (posterior) at the bottom."""
+    return np.flipud(sl)
+
+
+def window(img: np.ndarray, center: float, width: float) -> np.ndarray:
+    lo, hi = center - width / 2.0, center + width / 2.0
+    return np.clip((img - lo) / (hi - lo), 0.0, 1.0)
+
+
+def render_level(level_title: str, sidx: int,
+                 columns: List[Tuple[str, np.ndarray]],
+                 ncct: np.ndarray, cect: np.ndarray,
+                 win_c: float, win_w: float, diff_max: float,
+                 out_path: Path, case_id: str) -> None:
+    """One figure: a row of images (NCCT | CECT | each model) over a row of
+    subtraction maps (CECT-NCCT for the NCCT column, synth-CECT for models)."""
+    ncols = len(columns) + 2                 # + NCCT + real CECT
+    fig, axes = plt.subplots(2, ncols,
+                             figsize=(2.2 * ncols, 4.8),
+                             gridspec_kw={'wspace': 0.02, 'hspace': 0.06})
+    if ncols == 1:
+        axes = axes.reshape(2, 1)
+
+    cect_d = to_display(cect[sidx])
+    ncct_d = to_display(ncct[sidx]) if ncct is not None else None
+
+    def _img(ax, arr):
+        ax.imshow(window(arr, win_c, win_w), cmap='gray', vmin=0, vmax=1)
+        ax.axis('off')
+
+    def _diff(ax, arr):
+        return ax.imshow(arr, cmap='bwr', vmin=-diff_max, vmax=diff_max)
+
+    # Column 0: NCCT  (subtraction = CECT - NCCT, the real enhancement target)
+    if ncct_d is not None:
+        _img(axes[0, 0], ncct_d)
+        _diff(axes[1, 0], cect_d - ncct_d)
+        axes[1, 0].axis('off')
+    else:
+        axes[0, 0].axis('off'); axes[1, 0].axis('off')
+    axes[0, 0].set_title('NCCT', fontsize=10)
+
+    # Column 1: real CECT (reference; no subtraction)
+    _img(axes[0, 1], cect_d)
+    axes[1, 1].axis('off')
+    axes[0, 1].set_title('CECT (real)', fontsize=10)
+
+    # Columns 2..: each model's synthetic CECT + (synth - real) subtraction
+    im = None
+    for j, (label, vol) in enumerate(columns, start=2):
+        syn_d = to_display(vol[sidx])
+        _img(axes[0, j], syn_d)
+        im = _diff(axes[1, j], syn_d - cect_d)
+        axes[1, j].axis('off')
+        axes[0, j].set_title(label, fontsize=10)
+
+    if im is not None:
+        cbar = fig.colorbar(im, ax=axes[1, :].tolist(), fraction=0.012,
+                            pad=0.01, aspect=40)
+        cbar.set_label('HU difference', fontsize=8)
+        cbar.ax.tick_params(labelsize=7)
+
+    axes[0, 0].set_ylabel('image', fontsize=9)
+    fig.suptitle(f'{level_title}  |  case {case_id[:24]}…  |  axial slice {sidx}',
+                 fontsize=12, y=0.99)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    print(f'  [saved] {out_path}')
+
+
+def render_multiplane(planes: List[Tuple[str, int]],
+                      columns: List[Tuple[str, np.ndarray]],
+                      ncct: np.ndarray, cect: np.ndarray, foot_high: bool,
+                      win_c: float, win_w: float, diff_max: float,
+                      out_path: Path, case_id: str) -> None:
+    """One figure spanning several planes (e.g. axial + coronal): for each plane
+    an image row (NCCT | CECT | each model) over a subtraction row (CECT-NCCT
+    for NCCT, synth-CECT for models). Mirrors the paper's multi-view panel."""
+    ncols = len(columns) + 2                       # + NCCT + real CECT
+    nrows = 2 * len(planes)
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(2.2 * ncols, 2.4 * nrows),
+                             squeeze=False,
+                             gridspec_kw={'wspace': 0.02, 'hspace': 0.04})
+
+    def _img(ax, arr):
+        # aspect='auto' fills the cell: coronal/sagittal reformats have far fewer
+        # slices than in-plane pixels, so 'equal' would render a thin sliver.
+        ax.imshow(window(arr, win_c, win_w), cmap='gray', vmin=0, vmax=1,
+                  aspect='auto')
+        ax.axis('off')
+
+    def _diff(ax, arr):
+        return ax.imshow(arr, cmap='bwr', vmin=-diff_max, vmax=diff_max,
+                         aspect='auto')
+
+    im = None
+    for p, (plane, idx) in enumerate(planes):
+        r_img, r_dif = 2 * p, 2 * p + 1
+        cect_d = extract_plane(cect, plane, idx, foot_high)
+        ncct_d = extract_plane(ncct, plane, idx, foot_high) if ncct is not None else None
+
+        # Column 0: NCCT + (CECT - NCCT) enhancement target
+        if ncct_d is not None:
+            _img(axes[r_img, 0], ncct_d)
+            _diff(axes[r_dif, 0], cect_d - ncct_d)
+        else:
+            axes[r_img, 0].axis('off')
+        axes[r_dif, 0].axis('off')
+        # Column 1: real CECT reference
+        _img(axes[r_img, 1], cect_d)
+        axes[r_dif, 1].axis('off')
+        # Columns 2..: each model + (synth - real) residual
+        for j, (label, vol) in enumerate(columns, start=2):
+            syn_d = extract_plane(vol, plane, idx, foot_high)
+            _img(axes[r_img, j], syn_d)
+            im = _diff(axes[r_dif, j], syn_d - cect_d)
+            axes[r_dif, j].axis('off')
+            if p == 0:
+                axes[r_img, j].set_title(label, fontsize=10)
+        if p == 0:
+            axes[r_img, 0].set_title('NCCT', fontsize=10)
+            axes[r_img, 1].set_title('CECT (real)', fontsize=10)
+        # Plane label down the left margin (image row = name, diff row = subtraction)
+        axes[r_img, 0].set_ylabel(f'{plane}\n(image)', fontsize=9,
+                                  rotation=90, labelpad=6)
+        axes[r_img, 0].axis('on'); axes[r_img, 0].set_xticks([]); axes[r_img, 0].set_yticks([])
+        for sp in axes[r_img, 0].spines.values():
+            sp.set_visible(False)
+
+    if im is not None:
+        cbar = fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.010,
+                            pad=0.01, aspect=50)
+        cbar.set_label('HU difference', fontsize=8)
+        cbar.ax.tick_params(labelsize=7)
+
+    view = ' + '.join(pl for pl, _ in planes)
+    fig.suptitle(f'{view} views  |  case {case_id[:24]}…', fontsize=12, y=0.995)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    print(f'  [saved] {out_path}')
+
+
+# --------------------------------------------------------------------------- #
+# Set assembly                                                                #
+# --------------------------------------------------------------------------- #
+
+# Default membership for each figure set: display label -> discovery key.
+# Only members whose manifest is actually discovered are used, so this stays
+# valid as runs come and go. Override with --comparison / --ablation.
+DEFAULT_COMPARISON = [
+    ('Pix2pixHD', 'pix2pixhd_baseline'),
+    ('CycleGAN',  'cyclegan'),
+    ('ResViT',    'resvit'),
+    ('CyTran',    'cytran'),
+    ('TransUNet', 'transunet'),
+    ('SwinUNETR', 'swinunetr_s5'),
+    ('GEA-GAN',   'gea_gan'),
+    ('DEA-GAN',   'dea_gan'),
+]
+DEFAULT_ABLATION = [
+    ('L1 only',           'l1_only'),
+    ('+ adv',             'l1_adv'),
+    ('+ organ',           'l1_adv_organ'),
+    ('+ curriculum',      'l1_organ_curriculum'),
+    ('bowel-zero',        'l1_bowel_zero'),
+    ('width32',           'width32'),
+    ('width96',           'width96'),
+    ('groupnorm',         'l1_organ_groupnorm_s44'),
+]
+
+
+def parse_spec(spec: str) -> List[Tuple[str, str]]:
+    """'Label=key,key2,Other=key3' -> [(label, key), ...]. A bare key uses the
+    key itself as its display label."""
+    out = []
+    for part in spec.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '=' in part:
+            label, key = part.split('=', 1)
+            out.append((label.strip(), key.strip()))
+        else:
+            out.append((part, part))
+    return out
+
+
+def resolve_members(members: List[Tuple[str, str]],
+                    manifests: Dict[str, Path]) -> List[Tuple[str, str]]:
+    """Keep only members present in the discovered manifests; warn on the rest."""
+    keep, miss = [], []
+    for label, key in members:
+        if key in manifests:
+            keep.append((label, key))
+        else:
+            miss.append(key)
+    if miss:
+        print(f'  [skip] not discovered: {", ".join(miss)}')
+    return keep
+
+
+def build_case_index(manifests: Dict[str, Path]) -> Dict[str, Dict[str, Dict]]:
+    """{case_key: {model_name: manifest_row}} across all discovered models."""
+    index: Dict[str, Dict[str, Dict]] = {}
+    for name, mpath in manifests.items():
+        try:
+            rows = read_manifest(mpath)
+        except Exception as e:
+            print(f'  [warn] cannot read {name} manifest ({e})')
+            continue
+        for r in rows:
+            if not r.get('real_path'):
+                continue
+            index.setdefault(case_key(r['real_path']), {})[name] = r
+    return index
+
+
+def pick_case(index: Dict[str, Dict[str, Dict]], need: List[str],
+              rng: random.Random, forced: Optional[str]) -> Optional[str]:
+    """A case covered by every required model. `forced` matches a case_id substring."""
+    ok = [ck for ck, models in index.items() if all(n in models for n in need)]
+    if forced:
+        ok = [ck for ck in ok if forced in ck]
+        if not ok:
+            print(f'  [error] --case {forced!r} matches no case covered by all '
+                  f'required models')
+            return None
+    if not ok:
+        return None
+    return rng.choice(sorted(ok))
+
+
+def run_set(set_name: str, members: List[Tuple[str, str]],
+            manifests: Dict[str, Path], index: Dict[str, Dict[str, Dict]],
+            labels: Dict[str, int], args, rng: random.Random) -> None:
+    ours_label, ours_key = 'Ours', args.ours
+    members = list(members)
+    if ours_key:
+        members = [(l, k) for (l, k) in members if k != ours_key]
+        members.append((ours_label, ours_key))     # our method last, as in the paper
+    members = resolve_members(members, manifests)
+    if not members:
+        print(f'[{set_name}] no members discovered — skipped')
+        return
+
+    need = [k for _, k in members]
+    case = pick_case(index, need, rng, args.case)
+    if case is None:
+        print(f'[{set_name}] no case is covered by ALL of: {", ".join(need)}\n'
+              f'          relax the member list or pass --case; skipped')
+        return
+
+    row0 = index[case][need[0]]
+    real_path, mask_path = row0['real_path'], row0['mask_path']
+    case_id = Path(real_path).parent.name
+    print(f'[{set_name}] case {case_id}  ({len(members)} models)')
+
+    cect = load_axial(real_path)
+    ncct_path = find_ncct(real_path)
+    ncct = load_axial(ncct_path) if ncct_path else None
+    if ncct is None:
+        print('  [warn] NCCT source not found; NCCT column will be blank')
+    try:
+        mask = load_axial(mask_path)
+    except Exception as e:
+        print(f'  [warn] mask unreadable ({e}); using depth-quantile slices')
+        mask = np.zeros_like(cect)
+
+    slices = choose_slices(mask, labels)
+
+    # Load every model's synthetic volume once; reuse across all levels.
+    cols: List[Tuple[str, np.ndarray]] = []
+    for label, key in members:
+        gen_path = index[case][key]['gen_path']
+        try:
+            vol = load_axial(gen_path)
+        except Exception as e:
+            print(f'  [warn] {label} ({key}) gen unreadable ({e}); skipped')
+            continue
+        if vol.shape != cect.shape:
+            print(f'  [warn] {label} shape {vol.shape} != CECT {cect.shape}; skipped')
+            continue
+        cols.append((label, vol))
+
+    for level_title, _names, _q, _mode in ANATOMICAL_LEVELS:
+        sidx = slices[level_title]
+        safe = re.sub(r'[^a-z0-9]+', '_', level_title.lower()).strip('_')
+        out = Path(args.out_dir) / set_name / f'{set_name}_{safe}_slice{sidx}.png'
+        render_level(level_title, sidx, cols, ncct, cect,
+                     args.win_center, args.win_width, args.diff_max,
+                     out, case_id)
+
+    # Multi-plane figure (axial + coronal [+ sagittal]) — one panel, all planes.
+    if args.multiplane:
+        planes_want = [p.strip().lower() for p in args.planes.split(',') if p.strip()]
+        cs = choose_plane_indices(mask, labels)
+        axial_idx = slices.get(args.axial_level, slices['Mid-liver'])
+        idx_for = {'axial': axial_idx,
+                   'coronal': cs['coronal'], 'sagittal': cs['sagittal']}
+        foot_high = _foot_is_high(mask, labels)
+        planes = [(p, idx_for[p]) for p in planes_want if p in idx_for]
+        if planes:
+            tag = '_'.join(p for p, _ in planes)
+            out = Path(args.out_dir) / set_name / f'{set_name}_multiplane_{tag}.png'
+            render_multiplane(planes, cols, ncct, cect, foot_high,
+                              args.win_center, args.win_width, args.diff_max,
+                              out, case_id)
+
+
+# --------------------------------------------------------------------------- #
+# Main                                                                        #
+# --------------------------------------------------------------------------- #
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description='Qualitative NCCT->CECT comparison / ablation figures',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    ap.add_argument('--runs_dir', default='../out_synthesis_train',
+                    help='our trained runs (<run>/phase_infer[/<phase>]/manifest.csv)')
+    ap.add_argument('--bench_dir', default='../bench_ncct2cect',
+                    help='vendored competing-model repos (**/manifest.csv)')
+    ap.add_argument('--manifest', action='append', default=[],
+                    metavar='name=path.csv',
+                    help='extra manifest(s); repeatable')
+    ap.add_argument('--set', choices=['comparison', 'ablation', 'both'],
+                    default='both')
+    ap.add_argument('--ours', default='l1_organ_groupnorm_s44',
+                    help='discovery key of the proposed method (added to every set)')
+    ap.add_argument('--comparison', default=None,
+                    help='override comparison members: "Label=key,key2,..."')
+    ap.add_argument('--ablation', default=None,
+                    help='override ablation members: "Label=key,..."')
+    ap.add_argument('--case', default=None,
+                    help='force a case (StudyInstanceUID substring); default random')
+    ap.add_argument('--seed', type=int, default=0, help='RNG seed for case pick')
+    ap.add_argument('--out_dir', default='analysis/figures')
+    ap.add_argument('--win_center', type=float, default=40.0,
+                    help='display window center (HU); 40/400 = soft-tissue')
+    ap.add_argument('--win_width', type=float, default=400.0,
+                    help='display window width (HU)')
+    ap.add_argument('--diff_max', type=float, default=150.0,
+                    help='subtraction colormap range is +/- this (HU)')
+    ap.add_argument('--multiplane', action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help='also emit a combined multi-view figure per set')
+    ap.add_argument('--planes', default='axial,coronal',
+                    help='planes for the multi-view figure (of axial,coronal,sagittal)')
+    ap.add_argument('--axial_level', default='Mid-liver',
+                    choices=[t for t, *_ in ANATOMICAL_LEVELS],
+                    help="which anatomical level supplies the multi-view axial row")
+    ap.add_argument('--list', action='store_true',
+                    help='print discovered models + table family and exit')
+    args = ap.parse_args()
+
+    manifests: Dict[str, Path] = {}
+    manifests.update(discover_runs(Path(args.runs_dir)))
+    manifests.update(discover_bench(Path(args.bench_dir)))
+    for spec in args.manifest:
+        if '=' not in spec:
+            print(f'[error] --manifest expects name=path, got {spec!r}')
+            return 2
+        name, path = spec.split('=', 1)
+        manifests[name.strip()] = Path(path.strip())
+
+    if not manifests:
+        print('[error] no manifests discovered. Check --runs_dir / --bench_dir, '
+              'and run infer_volume.py / the vendored repos first.')
+        return 2
+
+    if args.list:
+        print(f'Discovered {len(manifests)} models:\n')
+        for name in sorted(manifests):
+            print(f'  {model_family(name):32s}  {name:34s}  {manifests[name]}')
+        return 0
+
+    labels = load_label_map()
+    index = build_case_index(manifests)
+    if not index:
+        print('[error] manifests contained no readable rows.')
+        return 2
+
+    comp = parse_spec(args.comparison) if args.comparison else DEFAULT_COMPARISON
+    abla = parse_spec(args.ablation) if args.ablation else DEFAULT_ABLATION
+
+    # One RNG, seeded once, so --set both draws the SAME case for both figures
+    # whenever their required-model sets overlap on a case.
+    if args.set in ('comparison', 'both'):
+        run_set('comparison', comp, manifests, index, labels, args,
+                random.Random(args.seed))
+    if args.set in ('ablation', 'both'):
+        run_set('ablation', abla, manifests, index, labels, args,
+                random.Random(args.seed))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
