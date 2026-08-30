@@ -334,13 +334,29 @@ def window(img: np.ndarray, center: float, width: float) -> np.ndarray:
     return np.clip((img - lo) / (hi - lo), 0.0, 1.0)
 
 
+def diff_map(a_hu: np.ndarray, b_hu: np.ndarray,
+             clip_lo: float, clip_hi: float) -> np.ndarray:
+    """Difference of two HU slices AFTER clamping both to [clip_lo, clip_hi].
+
+    The generators are trained on HU clipped to a soft-tissue domain (default
+    [-200, 400]), so in a synthetic volume air and lung sit at the clip floor
+    while in the real scan they are ~-1000/-700. A raw synth-real subtraction is
+    then +800 HU across the whole background and saturates the colormap, hiding
+    the soft-tissue detail. Clamping both operands to the same domain makes
+    air/lung/bone cancel to ~0 and leaves only the differences that fall inside
+    the window we actually care about (parenchyma + vessels)."""
+    return np.clip(a_hu, clip_lo, clip_hi) - np.clip(b_hu, clip_lo, clip_hi)
+
+
 def render_level(level_title: str, sidx: int,
                  columns: List[Tuple[str, np.ndarray]],
                  ncct: np.ndarray, cect: np.ndarray,
                  win_c: float, win_w: float, diff_max: float,
+                 clip_lo: float, clip_hi: float, diff_mode: str,
                  out_path: Path, case_id: str) -> None:
     """One figure: a row of images (NCCT | CECT | each model) over a row of
-    subtraction maps (CECT-NCCT for the NCCT column, synth-CECT for models)."""
+    subtraction maps. Model subtraction is synth-CECT (error) or synth-NCCT
+    (enhancement); the NCCT column always shows the CECT-NCCT target."""
     ncols = len(columns) + 2                 # + NCCT + real CECT
     fig, axes = plt.subplots(2, ncols,
                              figsize=(2.2 * ncols, 4.8),
@@ -350,18 +366,20 @@ def render_level(level_title: str, sidx: int,
 
     cect_d = to_display(cect[sidx])
     ncct_d = to_display(ncct[sidx]) if ncct is not None else None
+    ref_d = ncct_d if (diff_mode == 'enhancement' and ncct_d is not None) else cect_d
 
     def _img(ax, arr):
         ax.imshow(window(arr, win_c, win_w), cmap='gray', vmin=0, vmax=1)
         ax.axis('off')
 
-    def _diff(ax, arr):
-        return ax.imshow(arr, cmap='bwr', vmin=-diff_max, vmax=diff_max)
+    def _diff(ax, a, b):
+        return ax.imshow(diff_map(a, b, clip_lo, clip_hi),
+                         cmap='bwr', vmin=-diff_max, vmax=diff_max)
 
     # Column 0: NCCT  (subtraction = CECT - NCCT, the real enhancement target)
     if ncct_d is not None:
         _img(axes[0, 0], ncct_d)
-        _diff(axes[1, 0], cect_d - ncct_d)
+        _diff(axes[1, 0], cect_d, ncct_d)
         axes[1, 0].axis('off')
     else:
         axes[0, 0].axis('off'); axes[1, 0].axis('off')
@@ -372,12 +390,12 @@ def render_level(level_title: str, sidx: int,
     axes[1, 1].axis('off')
     axes[0, 1].set_title('CECT (real)', fontsize=10)
 
-    # Columns 2..: each model's synthetic CECT + (synth - real) subtraction
+    # Columns 2..: each model + (synth - ref) subtraction, ref per diff_mode
     im = None
     for j, (label, vol) in enumerate(columns, start=2):
         syn_d = to_display(vol[sidx])
         _img(axes[0, j], syn_d)
-        im = _diff(axes[1, j], syn_d - cect_d)
+        im = _diff(axes[1, j], syn_d, ref_d)
         axes[1, j].axis('off')
         axes[0, j].set_title(label, fontsize=10)
 
@@ -400,10 +418,12 @@ def render_multiplane(planes: List[Tuple[str, int]],
                       columns: List[Tuple[str, np.ndarray]],
                       ncct: np.ndarray, cect: np.ndarray, foot_high: bool,
                       win_c: float, win_w: float, diff_max: float,
+                      clip_lo: float, clip_hi: float, diff_mode: str,
                       out_path: Path, case_id: str) -> None:
     """One figure spanning several planes (e.g. axial + coronal): for each plane
-    an image row (NCCT | CECT | each model) over a subtraction row (CECT-NCCT
-    for NCCT, synth-CECT for models). Mirrors the paper's multi-view panel."""
+    an image row (NCCT | CECT | each model) over a subtraction row. Model
+    subtraction is synth-CECT (error) or synth-NCCT (enhancement); the NCCT
+    column always shows the CECT-NCCT target. Mirrors the paper's multi-view."""
     ncols = len(columns) + 2                       # + NCCT + real CECT
     nrows = 2 * len(planes)
     fig, axes = plt.subplots(nrows, ncols,
@@ -418,31 +438,32 @@ def render_multiplane(planes: List[Tuple[str, int]],
                   aspect='auto')
         ax.axis('off')
 
-    def _diff(ax, arr):
-        return ax.imshow(arr, cmap='bwr', vmin=-diff_max, vmax=diff_max,
-                         aspect='auto')
+    def _diff(ax, a, b):
+        return ax.imshow(diff_map(a, b, clip_lo, clip_hi),
+                         cmap='bwr', vmin=-diff_max, vmax=diff_max, aspect='auto')
 
     im = None
     for p, (plane, idx) in enumerate(planes):
         r_img, r_dif = 2 * p, 2 * p + 1
         cect_d = extract_plane(cect, plane, idx, foot_high)
         ncct_d = extract_plane(ncct, plane, idx, foot_high) if ncct is not None else None
+        ref_d = ncct_d if (diff_mode == 'enhancement' and ncct_d is not None) else cect_d
 
         # Column 0: NCCT + (CECT - NCCT) enhancement target
         if ncct_d is not None:
             _img(axes[r_img, 0], ncct_d)
-            _diff(axes[r_dif, 0], cect_d - ncct_d)
+            _diff(axes[r_dif, 0], cect_d, ncct_d)
         else:
             axes[r_img, 0].axis('off')
         axes[r_dif, 0].axis('off')
         # Column 1: real CECT reference
         _img(axes[r_img, 1], cect_d)
         axes[r_dif, 1].axis('off')
-        # Columns 2..: each model + (synth - real) residual
+        # Columns 2..: each model + (synth - ref) residual, ref per diff_mode
         for j, (label, vol) in enumerate(columns, start=2):
             syn_d = extract_plane(vol, plane, idx, foot_high)
             _img(axes[r_img, j], syn_d)
-            im = _diff(axes[r_dif, j], syn_d - cect_d)
+            im = _diff(axes[r_dif, j], syn_d, ref_d)
             axes[r_dif, j].axis('off')
             if p == 0:
                 axes[r_img, j].set_title(label, fontsize=10)
@@ -579,6 +600,11 @@ def build_case_index(manifests: Dict[str, Path]) -> Dict[str, Dict[str, Dict]]:
     """{case_key: {model_name: manifest_row}} across all discovered models."""
     index: Dict[str, Dict[str, Dict]] = {}
     for name, mpath in manifests.items():
+        # Preset handles are added for every paper model; a tree that only has
+        # some of them yields many missing paths, which are not worth warning
+        # about. Only a path that exists but fails to parse is a real problem.
+        if not mpath.exists():
+            continue
         try:
             rows = read_manifest(mpath)
         except Exception as e:
@@ -664,6 +690,7 @@ def run_set(set_name: str, members: List[Tuple[str, str]],
         out = Path(args.out_dir) / set_name / f'{set_name}_{safe}_slice{sidx}.png'
         render_level(level_title, sidx, cols, ncct, cect,
                      args.win_center, args.win_width, args.diff_max,
+                     args.diff_clip_lo, args.diff_clip_hi, args.diff_mode,
                      out, case_id)
 
     # Multi-plane figure (axial + coronal [+ sagittal]) — one panel, all planes.
@@ -680,6 +707,7 @@ def run_set(set_name: str, members: List[Tuple[str, str]],
             out = Path(args.out_dir) / set_name / f'{set_name}_multiplane_{tag}.png'
             render_multiplane(planes, cols, ncct, cect, foot_high,
                               args.win_center, args.win_width, args.diff_max,
+                              args.diff_clip_lo, args.diff_clip_hi, args.diff_mode,
                               out, case_id)
 
 
@@ -722,8 +750,18 @@ def main() -> int:
                     help='display window center (HU); 40/400 = soft-tissue')
     ap.add_argument('--win_width', type=float, default=400.0,
                     help='display window width (HU)')
-    ap.add_argument('--diff_max', type=float, default=150.0,
-                    help='subtraction colormap range is +/- this (HU)')
+    ap.add_argument('--diff_max', type=float, default=100.0,
+                    help='subtraction colormap range is +/- this (HU); lower = '
+                         'more sensitive to soft-tissue detail')
+    ap.add_argument('--diff_clip_lo', type=float, default=-200.0,
+                    help='clamp both volumes to >= this HU before differencing '
+                         '(the model training floor; kills air/lung saturation)')
+    ap.add_argument('--diff_clip_hi', type=float, default=400.0,
+                    help='clamp both volumes to <= this HU before differencing')
+    ap.add_argument('--diff_mode', choices=['error', 'enhancement'],
+                    default='error',
+                    help="'error' = synth-CECT residual; 'enhancement' = "
+                         "synth-NCCT (contrast the model added)")
     ap.add_argument('--multiplane', action=argparse.BooleanOptionalAction,
                     default=True,
                     help='also emit a combined multi-view figure per set')
