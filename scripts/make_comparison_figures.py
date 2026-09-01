@@ -13,7 +13,16 @@ are produced:
 
 For each set it emits one axial figure per anatomical level plus, unless
 --no-multiplane, a combined multi-view figure (axial + coronal by default; add
-sagittal via --planes) with an image row and a subtraction row per plane.
+sagittal via --planes).
+
+Layout is square-first: instead of one long strip, NCCT | CECT | every model
+are laid out as panels wrapped into blocks (auto-sized to keep the figure
+roughly square via --per_row), so each slice is drawn large enough to read.
+Every panel carries a magnified organ ZOOM inset over the level's anatomy with
+the true organ boundary drawn on it (--zoom / --zoom_size / --no-zoom-contour),
+so boundary blur and mis-registration stand out model-by-model; the full IMAGE
+marks the zoom box; and a synth-ref DIFFERENCE row (--no-diff to drop it)
+carries the HU residual.
 
 Everything is driven off the SAME manifests benchmark.py already scores from
 (`<run>/phase_infer[/<phase>]/manifest.csv` under --runs_dir, plus any
@@ -59,17 +68,24 @@ Override any preset path with --manifest handle=/exact/path.
 import argparse
 import csv
 import json
+import math
 import random
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import matplotlib
 matplotlib.use('Agg')                     # headless
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 import nibabel as nib
 import numpy as np
+
+# Accent used for every zoom box / inset frame / organ contour so the eye reads
+# the box on the full slice and the magnified inset above it as one unit.
+_ACCENT = '#f0a202'          # amber box + inset frame
+_CONTOUR = '#22d3ee'         # cyan organ boundary (high contrast on grey CT)
 
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parent
@@ -329,6 +345,35 @@ def to_display(sl: np.ndarray) -> np.ndarray:
     return np.flipud(sl)
 
 
+def auto_per_row(n_panels: int, rows_per_block: int) -> int:
+    """Columns that make a block-wrapped panel grid as square as possible.
+
+    A block is `rows_per_block` tall; wrapping `n_panels` into `per_row` columns
+    gives ceil(n/per_row) blocks, so height ~= rows_per_block*ceil(n/per_row) and
+    width ~= per_row. Setting the two equal gives per_row ~= sqrt(rows*n)."""
+    pr = int(round(math.sqrt(max(rows_per_block, 1) * max(n_panels, 1))))
+    return int(min(max(pr, 3), n_panels)) if n_panels else 1
+
+
+def roi_box(mask_disp: np.ndarray, ids: Sequence[int], size: int,
+            shape: Tuple[int, int]) -> Tuple[int, int, int, int]:
+    """(r0, r1, c0, c1) square zoom window centred on the level's organ(s).
+
+    `mask_disp` is the segmentation slice in the SAME display orientation as the
+    images (so the box lands on the organ in every panel). Falls back to the
+    slice centre when none of `ids` are present."""
+    m = np.isin(mask_disp, list(ids)) if len(ids) else np.zeros(shape, bool)
+    if m.any():
+        rr, cc = np.nonzero(m)
+        r, c = int(round(rr.mean())), int(round(cc.mean()))
+    else:
+        r, c = shape[0] // 2, shape[1] // 2
+    sz_r, sz_c = min(size, shape[0]), min(size, shape[1])
+    r0 = int(np.clip(r - sz_r // 2, 0, shape[0] - sz_r))
+    c0 = int(np.clip(c - sz_c // 2, 0, shape[1] - sz_c))
+    return r0, r0 + sz_r, c0, c0 + sz_c
+
+
 def window(img: np.ndarray, center: float, width: float) -> np.ndarray:
     lo, hi = center - width / 2.0, center + width / 2.0
     return np.clip((img - lo) / (hi - lo), 0.0, 1.0)
@@ -351,63 +396,103 @@ def diff_map(a_hu: np.ndarray, b_hu: np.ndarray,
 def render_level(level_title: str, sidx: int,
                  columns: List[Tuple[str, np.ndarray]],
                  ncct: np.ndarray, cect: np.ndarray,
+                 mask_disp: np.ndarray, roi_ids: Sequence[int], zoom_size: int,
+                 show_zoom: bool, show_diff: bool, show_contour: bool,
                  win_c: float, win_w: float, diff_max: float,
                  clip_lo: float, clip_hi: float, diff_mode: str,
-                 out_path: Path, case_id: str) -> None:
-    """One figure: a row of images (NCCT | CECT | each model) over a row of
-    subtraction maps. Model subtraction is synth-CECT (error) or synth-NCCT
-    (enhancement); the NCCT column always shows the CECT-NCCT target."""
-    ncols = len(columns) + 2                 # + NCCT + real CECT
-    fig, axes = plt.subplots(2, ncols,
-                             figsize=(2.2 * ncols, 4.8),
-                             gridspec_kw={'wspace': 0.02, 'hspace': 0.06})
-    if ncols == 1:
-        axes = axes.reshape(2, 1)
+                 per_row: int, out_path: Path, case_id: str) -> None:
+    """One square-ish figure per anatomical level.
 
+    Each of NCCT | CECT | every model is one *panel*; a panel stacks up to three
+    rows — an organ-boundary ZOOM (magnified crop over the level's organ, with
+    the true boundary drawn on so blur / mis-registration is obvious), the full
+    IMAGE (with the zoom box marked), and the synth−ref DIFFERENCE map. Panels
+    are wrapped into blocks of `per_row` columns so many models still lay out
+    close to square, with each slice drawn large enough to read. Model
+    subtraction is synth−CECT (error) or synth−NCCT (enhancement); the NCCT panel
+    always shows the CECT−NCCT target."""
     cect_d = to_display(cect[sidx])
     ncct_d = to_display(ncct[sidx]) if ncct is not None else None
     ref_d = ncct_d if (diff_mode == 'enhancement' and ncct_d is not None) else cect_d
 
-    def _img(ax, arr):
-        ax.imshow(window(arr, win_c, win_w), cmap='gray', vmin=0, vmax=1)
+    # panel = (label, image_display_or_None, (minuend, subtrahend)_or_None)
+    panels: List[Tuple[str, Optional[np.ndarray],
+                       Optional[Tuple[np.ndarray, np.ndarray]]]] = []
+    panels.append(('NCCT', ncct_d, (cect_d, ncct_d) if ncct_d is not None else None))
+    panels.append(('CECT (real)', cect_d, None))
+    for label, vol in columns:
+        syn_d = to_display(vol[sidx])
+        panels.append((label, syn_d, (syn_d, ref_d)))
+
+    roles = (['zoom'] if show_zoom else []) + ['image'] + (['diff'] if show_diff else [])
+    rpb = len(roles)
+    npan = len(panels)
+    pr = min(per_row, npan) if per_row and per_row > 0 else auto_per_row(npan, rpb)
+    nblocks = math.ceil(npan / pr)
+    ncols, nrows = min(pr, npan), rpb * nblocks
+
+    r0, r1, c0, c1 = roi_box(mask_disp, roi_ids, zoom_size, cect_d.shape)
+    organ_crop = (np.isin(mask_disp[r0:r1, c0:c1], list(roi_ids))
+                  if show_contour and len(roi_ids) else None)
+
+    cell = 2.6
+    fig, axes = plt.subplots(nrows, ncols, squeeze=False,
+                             figsize=(cell * ncols, cell * nrows + 0.4),
+                             gridspec_kw={'wspace': 0.02, 'hspace': 0.05})
+    for ax in axes.ravel():
         ax.axis('off')
 
-    def _diff(ax, a, b):
-        return ax.imshow(diff_map(a, b, clip_lo, clip_hi),
-                         cmap='bwr', vmin=-diff_max, vmax=diff_max)
+    def _gray(ax, arr):
+        ax.imshow(window(arr, win_c, win_w), cmap='gray', vmin=0, vmax=1,
+                  interpolation='nearest')
 
-    # Column 0: NCCT  (subtraction = CECT - NCCT, the real enhancement target)
-    if ncct_d is not None:
-        _img(axes[0, 0], ncct_d)
-        _diff(axes[1, 0], cect_d, ncct_d)
-        axes[1, 0].axis('off')
-    else:
-        axes[0, 0].axis('off'); axes[1, 0].axis('off')
-    axes[0, 0].set_title('NCCT', fontsize=10)
-
-    # Column 1: real CECT (reference; no subtraction)
-    _img(axes[0, 1], cect_d)
-    axes[1, 1].axis('off')
-    axes[0, 1].set_title('CECT (real)', fontsize=10)
-
-    # Columns 2..: each model + (synth - ref) subtraction, ref per diff_mode
     im = None
-    for j, (label, vol) in enumerate(columns, start=2):
-        syn_d = to_display(vol[sidx])
-        _img(axes[0, j], syn_d)
-        im = _diff(axes[1, j], syn_d, ref_d)
-        axes[1, j].axis('off')
-        axes[0, j].set_title(label, fontsize=10)
+    for k, (label, img_d, dspec) in enumerate(panels):
+        b, j = divmod(k, pr)
+        base, ri = b * rpb, 0
+        if show_zoom:                                   # magnified organ crop
+            axz = axes[base + ri, j]; ri += 1
+            if img_d is not None:
+                _gray(axz, img_d[r0:r1, c0:c1])
+                if organ_crop is not None and organ_crop.any():
+                    axz.contour(organ_crop.astype(float), levels=[0.5],
+                                colors=[_CONTOUR], linewidths=1.1)
+                axz.axis('on'); axz.set_xticks([]); axz.set_yticks([])
+                for s in axz.spines.values():
+                    s.set_color(_ACCENT); s.set_linewidth(1.3)
+            axz.set_title(label, fontsize=11, pad=3)
+        axi = axes[base + ri, j]; ri += 1               # full slice + zoom box
+        if img_d is not None:
+            _gray(axi, img_d)
+            axi.add_patch(Rectangle((c0, r0), c1 - c0, r1 - r0,
+                                    fill=False, ec=_ACCENT, lw=1.1))
+        if not show_zoom:
+            axi.set_title(label, fontsize=11, pad=3)
+        if show_diff:                                   # synth − ref residual
+            axd = axes[base + ri, j]
+            if dspec is not None:
+                im = axd.imshow(diff_map(dspec[0], dspec[1], clip_lo, clip_hi),
+                                cmap='bwr', vmin=-diff_max, vmax=diff_max,
+                                interpolation='nearest')
+
+    # role label down the left edge of every block
+    for b in range(nblocks):
+        for ri, role in enumerate(roles):
+            ax = axes[b * rpb + ri, 0]
+            ax.axis('on'); ax.set_xticks([]); ax.set_yticks([])
+            for s in ax.spines.values():
+                if not (role == 'zoom'):
+                    s.set_visible(False)
+            ax.set_ylabel(role, fontsize=10, labelpad=4)
 
     if im is not None:
-        cbar = fig.colorbar(im, ax=axes[1, :].tolist(), fraction=0.012,
+        cbar = fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.012,
                             pad=0.01, aspect=40)
         cbar.set_label('HU difference', fontsize=8)
         cbar.ax.tick_params(labelsize=7)
 
-    axes[0, 0].set_ylabel('image', fontsize=9)
     fig.suptitle(f'{level_title}  |  case {case_id[:24]}…  |  axial slice {sidx}',
-                 fontsize=12, y=0.99)
+                 fontsize=13, y=0.997)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=200, bbox_inches='tight')
     plt.close(fig)
@@ -419,63 +504,80 @@ def render_multiplane(planes: List[Tuple[str, int]],
                       ncct: np.ndarray, cect: np.ndarray, foot_high: bool,
                       win_c: float, win_w: float, diff_max: float,
                       clip_lo: float, clip_hi: float, diff_mode: str,
-                      out_path: Path, case_id: str) -> None:
-    """One figure spanning several planes (e.g. axial + coronal): for each plane
-    an image row (NCCT | CECT | each model) over a subtraction row. Model
-    subtraction is synth-CECT (error) or synth-NCCT (enhancement); the NCCT
-    column always shows the CECT-NCCT target. Mirrors the paper's multi-view."""
-    ncols = len(columns) + 2                       # + NCCT + real CECT
-    nrows = 2 * len(planes)
-    fig, axes = plt.subplots(nrows, ncols,
-                             figsize=(2.2 * ncols, 2.4 * nrows),
-                             squeeze=False,
-                             gridspec_kw={'wspace': 0.02, 'hspace': 0.04})
+                      per_row: int, out_path: Path, case_id: str) -> None:
+    """One figure spanning several planes (e.g. axial + coronal). Each of
+    NCCT | CECT | every model is a *panel* holding, per plane, an image row over
+    a synth−ref subtraction row. Panels wrap into blocks of `per_row` columns so
+    the multi-view stays close to square instead of stretching into one long
+    strip. The NCCT panel's subtraction is always the CECT−NCCT target."""
+    # Pre-extract every plane for every panel: panel = (label, [(img, diff|None)])
+    panels: List[Tuple[str, List[Tuple[Optional[np.ndarray],
+                                       Optional[Tuple[np.ndarray, np.ndarray]]]]]] = []
+
+    def _panel(label, vol, is_ncct=False, is_ref=False):
+        rows = []
+        for plane, idx in planes:
+            cect_d = extract_plane(cect, plane, idx, foot_high)
+            ncct_d = extract_plane(ncct, plane, idx, foot_high) if ncct is not None else None
+            ref_d = ncct_d if (diff_mode == 'enhancement' and ncct_d is not None) else cect_d
+            if is_ncct:
+                img = ncct_d
+                dif = (cect_d, ncct_d) if ncct_d is not None else None
+            elif is_ref:
+                img, dif = cect_d, None
+            else:
+                img = extract_plane(vol, plane, idx, foot_high)
+                dif = (img, ref_d)
+            rows.append((img, dif))
+        return label, rows
+
+    panels.append(_panel('NCCT', None, is_ncct=True))
+    panels.append(_panel('CECT (real)', None, is_ref=True))
+    for label, vol in columns:
+        panels.append(_panel(label, vol))
+
+    rpb = 2 * len(planes)                          # image+diff per plane
+    npan = len(panels)
+    pr = min(per_row, npan) if per_row and per_row > 0 else auto_per_row(npan, rpb)
+    nblocks = math.ceil(npan / pr)
+    ncols, nrows = min(pr, npan), rpb * nblocks
+
+    cell = 2.4
+    fig, axes = plt.subplots(nrows, ncols, squeeze=False,
+                             figsize=(cell * ncols, cell * nrows + 0.4),
+                             gridspec_kw={'wspace': 0.02, 'hspace': 0.05})
+    for ax in axes.ravel():
+        ax.axis('off')
 
     def _img(ax, arr):
         # aspect='auto' fills the cell: coronal/sagittal reformats have far fewer
         # slices than in-plane pixels, so 'equal' would render a thin sliver.
         ax.imshow(window(arr, win_c, win_w), cmap='gray', vmin=0, vmax=1,
-                  aspect='auto')
-        ax.axis('off')
-
-    def _diff(ax, a, b):
-        return ax.imshow(diff_map(a, b, clip_lo, clip_hi),
-                         cmap='bwr', vmin=-diff_max, vmax=diff_max, aspect='auto')
+                  aspect='auto', interpolation='nearest')
 
     im = None
-    for p, (plane, idx) in enumerate(planes):
-        r_img, r_dif = 2 * p, 2 * p + 1
-        cect_d = extract_plane(cect, plane, idx, foot_high)
-        ncct_d = extract_plane(ncct, plane, idx, foot_high) if ncct is not None else None
-        ref_d = ncct_d if (diff_mode == 'enhancement' and ncct_d is not None) else cect_d
+    for k, (label, rows) in enumerate(panels):
+        b, j = divmod(k, pr)
+        base = b * rpb
+        for p, (img, dif) in enumerate(rows):
+            r_img, r_dif = base + 2 * p, base + 2 * p + 1
+            if img is not None:
+                _img(axes[r_img, j], img)
+            if dif is not None:
+                im = axes[r_dif, j].imshow(diff_map(dif[0], dif[1], clip_lo, clip_hi),
+                                           cmap='bwr', vmin=-diff_max, vmax=diff_max,
+                                           aspect='auto', interpolation='nearest')
+        axes[base, j].set_title(label, fontsize=11, pad=3)
 
-        # Column 0: NCCT + (CECT - NCCT) enhancement target
-        if ncct_d is not None:
-            _img(axes[r_img, 0], ncct_d)
-            _diff(axes[r_dif, 0], cect_d, ncct_d)
-        else:
-            axes[r_img, 0].axis('off')
-        axes[r_dif, 0].axis('off')
-        # Column 1: real CECT reference
-        _img(axes[r_img, 1], cect_d)
-        axes[r_dif, 1].axis('off')
-        # Columns 2..: each model + (synth - ref) residual, ref per diff_mode
-        for j, (label, vol) in enumerate(columns, start=2):
-            syn_d = extract_plane(vol, plane, idx, foot_high)
-            _img(axes[r_img, j], syn_d)
-            im = _diff(axes[r_dif, j], syn_d, ref_d)
-            axes[r_dif, j].axis('off')
-            if p == 0:
-                axes[r_img, j].set_title(label, fontsize=10)
-        if p == 0:
-            axes[r_img, 0].set_title('NCCT', fontsize=10)
-            axes[r_img, 1].set_title('CECT (real)', fontsize=10)
-        # Plane label down the left margin (image row = name, diff row = subtraction)
-        axes[r_img, 0].set_ylabel(f'{plane}\n(image)', fontsize=9,
-                                  rotation=90, labelpad=6)
-        axes[r_img, 0].axis('on'); axes[r_img, 0].set_xticks([]); axes[r_img, 0].set_yticks([])
-        for sp in axes[r_img, 0].spines.values():
-            sp.set_visible(False)
+    # plane / row labels down the left edge of every block
+    for b in range(nblocks):
+        for p, (plane, _idx) in enumerate(planes):
+            for ri, role in ((2 * p, f'{plane}\nimage'), (2 * p + 1, f'{plane}\ndiff')):
+                ax = axes[b * rpb + ri, 0]
+                ax.axis('on'); ax.set_xticks([]); ax.set_yticks([])
+                for sp in ax.spines.values():
+                    sp.set_visible(False)
+                ax.set_ylabel(role, fontsize=9, labelpad=4)
 
     if im is not None:
         cbar = fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.010,
@@ -484,7 +586,7 @@ def render_multiplane(planes: List[Tuple[str, int]],
         cbar.ax.tick_params(labelsize=7)
 
     view = ' + '.join(pl for pl, _ in planes)
-    fig.suptitle(f'{view} views  |  case {case_id[:24]}…', fontsize=12, y=0.995)
+    fig.suptitle(f'{view} views  |  case {case_id[:24]}…', fontsize=13, y=0.997)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=200, bbox_inches='tight')
     plt.close(fig)
@@ -686,12 +788,16 @@ def run_set(set_name: str, members: List[Tuple[str, str]],
 
     for level_title, _names, _q, _mode in ANATOMICAL_LEVELS:
         sidx = slices[level_title]
+        roi_ids = [labels[n] for n in _names if n in labels]
+        mask_disp = to_display(mask[sidx])
         safe = re.sub(r'[^a-z0-9]+', '_', level_title.lower()).strip('_')
         out = Path(args.out_dir) / set_name / f'{set_name}_{safe}_slice{sidx}.png'
         render_level(level_title, sidx, cols, ncct, cect,
+                     mask_disp, roi_ids, args.zoom_size,
+                     args.zoom, args.diff, args.zoom_contour,
                      args.win_center, args.win_width, args.diff_max,
                      args.diff_clip_lo, args.diff_clip_hi, args.diff_mode,
-                     out, case_id)
+                     args.per_row, out, case_id)
 
     # Multi-plane figure (axial + coronal [+ sagittal]) — one panel, all planes.
     if args.multiplane:
@@ -708,7 +814,7 @@ def run_set(set_name: str, members: List[Tuple[str, str]],
             render_multiplane(planes, cols, ncct, cect, foot_high,
                               args.win_center, args.win_width, args.diff_max,
                               args.diff_clip_lo, args.diff_clip_hi, args.diff_mode,
-                              out, case_id)
+                              args.per_row, out, case_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -762,6 +868,19 @@ def main() -> int:
                     default='error',
                     help="'error' = synth-CECT residual; 'enhancement' = "
                          "synth-NCCT (contrast the model added)")
+    ap.add_argument('--per_row', type=int, default=0,
+                    help='panels per block before wrapping to a new row-block; '
+                         '0 = auto (chosen to make the figure roughly square)')
+    ap.add_argument('--zoom', action=argparse.BooleanOptionalAction, default=True,
+                    help='add a magnified organ-boundary inset above each panel')
+    ap.add_argument('--zoom_size', type=int, default=96,
+                    help='side length (in voxels) of the organ zoom window')
+    ap.add_argument('--zoom_contour', action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help='draw the real organ boundary on every zoom inset so '
+                         'boundary blur / mis-registration is visible per model')
+    ap.add_argument('--diff', action=argparse.BooleanOptionalAction, default=True,
+                    help='include the synth-ref subtraction row in each figure')
     ap.add_argument('--multiplane', action=argparse.BooleanOptionalAction,
                     default=True,
                     help='also emit a combined multi-view figure per set')
